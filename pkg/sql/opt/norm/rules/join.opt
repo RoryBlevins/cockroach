@@ -534,25 +534,59 @@ $left
 
 #ConvertProjectionsToFiltersLeft
 [ConvertProjectionsToFiltersLeft, Normalize]
-(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply | SemiJoin
-    $left:(Project)
+(InnerJoin | LeftJoin | SemiJoin
+    $left: (Project  $input:* $projections:* $passthrough:*)
     $right:*
-    $on: * & (CanExtractTupleEqualityLeft $left $right $on)
+    $on:[
+        ...
+            (FiltersItem (Eq (Variable) (Tuple))) &
+            (CanExtractTupleEquality
+                $projections
+                $on
+            ) 
+        ...
+    ]
     $private:*
 )
 =>
-(ExtractTupleEqualityLeft (OpName) $left $right $on $private)
+(Project 
+    ((OpName)
+        $input
+        $right
+        (RewriteTupleEquality $on $projections)
+        $private
+    )
+    $projections 
+    (UnionCols $passthrough (OutputCols $right))
+)
 
 #ConvertProjectionsToFiltersRight
 [ConvertProjectionsToFiltersRight, Normalize]
-(InnerJoin | InnerJoinApply | LeftJoin | LeftJoinApply | SemiJoin
+(InnerJoin | LeftJoin | SemiJoin
     $left: *
-    $right:(Project)
-    $on: * & (CanExtractTupleEqualityRight $left $right $on )
+    $right:(Project $input:* $projections:* *)
+    $on:[
+        ...
+            (FiltersItem (Eq (Variable) (Tuple))) &
+            (CanExtractTupleEquality
+                $projections
+                $on
+            ) 
+        ...
+    ]
     $private:*
 )
 =>
-(ExtractTupleEqualityRight (OpName) $left $right $on $private)
+(Project 
+    ((OpName)
+        $left
+        $input
+        (RewriteTupleEquality $on $projections)
+        $private
+    )
+    $projections 
+    (UnionCols $passthrough (OutputCols $left))
+)
 
 # ExtractJoinEqualities finds equality conditions such that one side only
 # depends on left columns and the other only on right columns and pushes the
