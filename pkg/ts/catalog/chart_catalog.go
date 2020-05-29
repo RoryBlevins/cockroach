@@ -624,6 +624,7 @@ var charts = []sectionDescription{
 		Organization: [][]string{
 			{KVTransactionLayer, "Requests", "Slow"},
 			{ReplicationLayer, "Requests", "Slow"},
+			{DistributionLayer, "Requests", "Slow"},
 		},
 		Charts: []chartDescription{
 			{
@@ -643,6 +644,12 @@ var charts = []sectionDescription{
 				Downsampler: DescribeAggregator_MAX,
 				Percentiles: false,
 				Metrics:     []string{"requests.slow.raft"},
+			},
+			{
+				Title:       "Stuck sending RPCs to range",
+				Downsampler: DescribeAggregator_MAX,
+				Percentiles: false,
+				Metrics:     []string{"requests.slow.distsender"},
 			},
 		},
 	},
@@ -765,8 +772,20 @@ var charts = []sectionDescription{
 				Metrics: []string{"txn.aborts"},
 			},
 			{
-				Title:   "Auto Retries",
-				Metrics: []string{"txn.autoretries"},
+				Title:   "Successful refreshes",
+				Metrics: []string{"txn.refresh.success"},
+			},
+			{
+				Title:   "Failed refreshes",
+				Metrics: []string{"txn.refresh.fail"},
+			},
+			{
+				Title:   "Failed refreshes with condensed spans",
+				Metrics: []string{"txn.refresh.fail_with_condensed_spans"},
+			},
+			{
+				Title:   "Transactions exceeding refresh spans memory limit",
+				Metrics: []string{"txn.refresh.memory_limit_exceeded"},
 			},
 			{
 				Title: "Commits",
@@ -1370,6 +1389,14 @@ var charts = []sectionDescription{
 				Title:   "Vectorized Temporary Storage Open File Descriptors",
 				Metrics: []string{"sql.distsql.vec.openfds"},
 			},
+			{
+				Title:   "Current Disk Usage",
+				Metrics: []string{"sql.disk.distsql.current"},
+			},
+			{
+				Title:   "Disk Usage per Statement",
+				Metrics: []string{"sql.disk.distsql.max"},
+			},
 		},
 	},
 	{
@@ -1821,6 +1848,19 @@ var charts = []sectionDescription{
 			{
 				Title:   "Pending Compaction",
 				Metrics: []string{"rocksdb.estimated-pending-compaction"},
+			},
+			{
+				Title:   "Ingestion",
+				Metrics: []string{"rocksdb.ingested-bytes"},
+			},
+			{
+				Title: "Flush & Compaction",
+				Metrics: []string{
+					"rocksdb.compacted-bytes-read",
+					"rocksdb.compacted-bytes-written",
+					"rocksdb.flushed-bytes",
+				},
+				AxisLabel: "Bytes",
 			},
 		},
 	},

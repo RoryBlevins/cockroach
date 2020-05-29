@@ -21,8 +21,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -34,7 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 func TestRoundtripJob(t *testing.T) {
@@ -83,14 +83,15 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		const cancelInterval = time.Duration(math.MaxInt64)
 		const adoptInterval = time.Nanosecond
 
+		var c base.NodeIDContainer
+		c.Set(ctx, id)
+		idContainer := base.NewSQLIDContainer(0, &c, true /* exposed */)
 		ac := log.AmbientContext{Tracer: tracing.NewTracer()}
-		nodeID := &base.NodeIDContainer{}
-		nodeID.Reset(id)
 		r := jobs.MakeRegistry(
-			ac, s.Stopper(), clock, db, s.InternalExecutor().(sqlutil.InternalExecutor),
-			nodeID, s.ClusterSettings(), server.DefaultHistogramWindowInterval, jobs.FakePHS, "",
+			ac, s.Stopper(), clock, sqlbase.MakeOptionalNodeLiveness(nodeLiveness), db, s.InternalExecutor().(sqlutil.InternalExecutor),
+			idContainer, s.ClusterSettings(), base.DefaultHistogramWindowInterval(), jobs.FakePHS, "",
 		)
-		if err := r.Start(ctx, s.Stopper(), nodeLiveness, cancelInterval, adoptInterval); err != nil {
+		if err := r.Start(ctx, s.Stopper(), cancelInterval, adoptInterval); err != nil {
 			t.Fatal(err)
 		}
 		return r
@@ -128,7 +129,7 @@ func TestRegistryResumeExpiredLease(t *testing.T) {
 		hookCallCount++
 		lock.Unlock()
 		return jobs.FakeResumer{
-			OnResume: func(ctx context.Context) error {
+			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -246,7 +247,7 @@ func TestRegistryResumeActiveLease(t *testing.T) {
 	defer jobs.ResetConstructors()()
 	jobs.RegisterConstructor(jobspb.TypeBackup, func(job *jobs.Job, _ *cluster.Settings) jobs.Resumer {
 		return jobs.FakeResumer{
-			OnResume: func(ctx context.Context) error {
+			OnResume: func(ctx context.Context, _ chan<- tree.Datums) error {
 				select {
 				case <-ctx.Done():
 					return ctx.Err()

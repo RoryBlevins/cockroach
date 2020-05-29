@@ -32,8 +32,6 @@ type CreateRoleNode struct {
 	isRole      bool
 	roleOptions roleoption.List
 	userNameInfo
-
-	run createUserRun
 }
 
 var userTableName = tree.NewTableName("system", "users")
@@ -41,13 +39,13 @@ var userTableName = tree.NewTableName("system", "users")
 // RoleOptionsTableName represents system.role_options.
 var RoleOptionsTableName = tree.NewTableName("system", "role_options")
 
-// CreateUser is an alias for CreateRole.
+// CreateRole represents a CREATE ROLE statement.
 // Privileges: INSERT on system.users.
 //   notes: postgres allows the creation of users with an empty password. We do
 //          as well, but disallow password authentication for these users.
-func (p *planner) CreateUser(ctx context.Context, n *tree.CreateUser) (planNode, error) {
+func (p *planner) CreateRole(ctx context.Context, n *tree.CreateRole) (planNode, error) {
 	return p.CreateRoleNode(ctx, n.Name, n.IfNotExists, n.IsRole,
-		"CREATE USER", n.KVOptions)
+		"CREATE ROLE", n.KVOptions)
 }
 
 // CreateRoleNode creates a "create user" plan node.
@@ -64,7 +62,10 @@ func (p *planner) CreateRoleNode(
 		return nil, err
 	}
 
-	roleOptions, err := kvOptions.ToRoleOptions(p.TypeAsStringOrNull, opName)
+	asStringOrNull := func(e tree.Expr, op string) (func() (bool, string, error), error) {
+		return p.TypeAsStringOrNull(ctx, e, op)
+	}
+	roleOptions, err := kvOptions.ToRoleOptions(asStringOrNull, opName)
 
 	// Using CREATE ROLE syntax enables NOLOGIN by default.
 	if isRole && !roleOptions.Contains(roleoption.LOGIN) &&
@@ -81,7 +82,7 @@ func (p *planner) CreateRoleNode(
 		return nil, err
 	}
 
-	ua, err := p.getUserAuthInfo(nameE, opName)
+	ua, err := p.getUserAuthInfo(ctx, nameE, opName)
 	if err != nil {
 		return nil, err
 	}
@@ -127,6 +128,13 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 			return pgerror.New(pgcode.InvalidPassword,
 				"setting or updating a password is not supported in insecure mode")
 		}
+	} else {
+		// v20.1 and below crash during authentication if they find a NULL value
+		// in system.users.hashedPassword. v20.2 and above handle this correctly,
+		// but we need to maintain mixed version compatibility for at least one
+		// release.
+		// TODO(nvanbenschoten): remove this for v21.1.
+		hashedPassword = []byte{}
 	}
 
 	// Reject the "public" role. It does not have an entry in the users table but is reserved.
@@ -155,7 +163,7 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 	}
 
 	// TODO(richardjcai): move hashedPassword column to system.role_options.
-	n.run.rowsAffected, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+	rowsAffected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
 		params.ctx,
 		opName,
 		params.p.txn,
@@ -167,9 +175,9 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 
 	if err != nil {
 		return err
-	} else if n.run.rowsAffected != 1 {
+	} else if rowsAffected != 1 {
 		return errors.AssertionFailedf("%d rows affected by user creation; expected exactly one row affected",
-			n.run.rowsAffected,
+			rowsAffected,
 		)
 	}
 
@@ -197,7 +205,7 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 			}
 		}
 
-		rowsAffected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+		_, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
 			params.ctx,
 			opName,
 			params.p.txn,
@@ -208,14 +216,9 @@ func (n *CreateRoleNode) startExec(params runParams) error {
 		if err != nil {
 			return err
 		}
-		n.run.rowsAffected += rowsAffected
 	}
 
 	return nil
-}
-
-type createUserRun struct {
-	rowsAffected int
 }
 
 // Next implements the planNode interface.
@@ -226,9 +229,6 @@ func (*CreateRoleNode) Values() tree.Datums { return tree.Datums{} }
 
 // Close implements the planNode interface.
 func (*CreateRoleNode) Close(context.Context) {}
-
-// FastPathResults implements the planNodeFastPath interface.
-func (n *CreateRoleNode) FastPathResults() (int, bool) { return n.run.rowsAffected, true }
 
 const usernameHelp = "Usernames are case insensitive, must start with a letter, " +
 	"digit or underscore, may contain letters, digits, dashes, periods, or underscores, and must not exceed 63 characters."
@@ -272,8 +272,10 @@ type userNameInfo struct {
 	name func() (string, error)
 }
 
-func (p *planner) getUserAuthInfo(nameE tree.Expr, ctx string) (userNameInfo, error) {
-	name, err := p.TypeAsString(nameE, ctx)
+func (p *planner) getUserAuthInfo(
+	ctx context.Context, nameE tree.Expr, context string,
+) (userNameInfo, error) {
+	name, err := p.TypeAsString(ctx, nameE, context)
 	if err != nil {
 		return userNameInfo{}, err
 	}

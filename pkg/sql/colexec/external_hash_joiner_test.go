@@ -16,13 +16,14 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
@@ -40,37 +41,28 @@ func TestExternalHashJoiner(t *testing.T) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
-		Cfg:     &execinfra.ServerConfig{Settings: st},
+		Cfg: &execinfra.ServerConfig{
+			Settings:    st,
+			DiskMonitor: testDiskMonitor,
+		},
 	}
 
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
 
 	var (
-		memAccounts []*mon.BoundAccount
-		memMonitors []*mon.BytesMonitor
+		accounts []*mon.BoundAccount
+		monitors []*mon.BytesMonitor
 	)
 	rng, _ := randutil.NewPseudoRand()
 	// Test the case in which the default memory is used as well as the case in
 	// which the joiner spills to disk.
 	for _, spillForced := range []bool{false, true} {
 		flowCtx.Cfg.TestingKnobs.ForceDiskSpill = spillForced
-		for _, tcs := range [][]joinTestCase{hjTestCases, mjTestCases} {
+		for _, tcs := range [][]*joinTestCase{hjTestCases, mjTestCases} {
 			for _, tc := range tcs {
 				delegateFDAcquisitions := rng.Float64() < 0.5
 				t.Run(fmt.Sprintf("spillForced=%t/%s/delegateFDAcquisitions=%t", spillForced, tc.description, delegateFDAcquisitions), func(t *testing.T) {
-					// Unfortunately, there is currently no better way to check that the
-					// external hash joiner does not have leftover file descriptors other
-					// than appending each semaphore used to this slice on construction.
-					// This is because some tests don't fully drain the input, making
-					// intercepting the Close() method not a useful option, since it is
-					// impossible to check between an expected case where more than 0 FDs
-					// are open (e.g. in allNullsInjection, where the joiner is not fully
-					// drained so Close must be called explicitly) and an unexpected one.
-					// These cases happen during normal execution when a limit is
-					// satisfied, but flows will call Close explicitly on Cleanup.
-					// TODO(yuzefovich): not implemented yet, currently we rely on the
-					// flow tracking open FDs and releasing any leftovers.
 					var semsToCheck []semaphore.Semaphore
 					if !tc.onExpr.Empty() {
 						// When we have ON expression, there might be other operators (like
@@ -83,16 +75,26 @@ func TestExternalHashJoiner(t *testing.T) {
 						}(tc.skipAllNullsInjection)
 						tc.skipAllNullsInjection = true
 					}
-					runHashJoinTestCase(t, tc, func(sources []Operator) (Operator, error) {
-						sem := NewTestingSemaphore(externalHJMinPartitions)
+					runHashJoinTestCase(t, tc, func(sources []colexecbase.Operator) (colexecbase.Operator, error) {
+						sem := colexecbase.NewTestingSemaphore(externalHJMinPartitions)
 						semsToCheck = append(semsToCheck, sem)
 						spec := createSpecForHashJoiner(tc)
-						hjOp, accounts, monitors, err := createDiskBackedHashJoiner(
+						// TODO(asubiotto): Pass in the testing.T of the caller to this
+						//  function and do substring matching on the test name to
+						//  conditionally explicitly call Close() on the hash joiner
+						//  (through result.ToClose) in cases where it is known the sorter
+						//  will not be drained.
+						hjOp, newAccounts, newMonitors, closers, err := createDiskBackedHashJoiner(
 							ctx, flowCtx, spec, sources, func() {}, queueCfg,
 							2 /* numForcedPartitions */, delegateFDAcquisitions, sem,
 						)
-						memAccounts = append(memAccounts, accounts...)
-						memMonitors = append(memMonitors, monitors...)
+						// Expect three closers. These are the external hash joiner, and
+						// one external sorter for each input.
+						// TODO(asubiotto): Explicitly Close when testing.T is passed into
+						//  this constructor and we do a substring match.
+						require.Equal(t, 3, len(closers))
+						accounts = append(accounts, newAccounts...)
+						monitors = append(monitors, newMonitors...)
 						return hjOp, err
 					})
 					for i, sem := range semsToCheck {
@@ -102,11 +104,11 @@ func TestExternalHashJoiner(t *testing.T) {
 			}
 		}
 	}
-	for _, memAccount := range memAccounts {
-		memAccount.Close(ctx)
+	for _, acc := range accounts {
+		acc.Close(ctx)
 	}
-	for _, memMonitor := range memMonitors {
-		memMonitor.Stop(ctx)
+	for _, mon := range monitors {
+		mon.Stop(ctx)
 	}
 }
 
@@ -128,38 +130,45 @@ func TestExternalHashJoinerFallbackToSortMergeJoin(t *testing.T) {
 				ForceDiskSpill:   true,
 				MemoryLimitBytes: 1,
 			},
+			DiskMonitor: testDiskMonitor,
 		},
 	}
-	sourceTypes := []coltypes.T{coltypes.Int64}
+	sourceTypes := []*types.T{types.Int}
 	batch := testAllocator.NewMemBatch(sourceTypes)
 	// We don't need to set the data since zero values in the columns work.
 	batch.SetLength(coldata.BatchSize())
 	nBatches := 2
-	leftSource := newFiniteBatchSource(batch, nBatches)
-	rightSource := newFiniteBatchSource(batch, nBatches)
-	spec := createSpecForHashJoiner(joinTestCase{
-		joinType:     sqlbase.JoinType_INNER,
+	leftSource := newFiniteBatchSource(batch, sourceTypes, nBatches)
+	rightSource := newFiniteBatchSource(batch, sourceTypes, nBatches)
+	tc := &joinTestCase{
+		joinType:     sqlbase.InnerJoin,
 		leftTypes:    sourceTypes,
 		leftOutCols:  []uint32{0},
 		leftEqCols:   []uint32{0},
 		rightTypes:   sourceTypes,
 		rightOutCols: []uint32{0},
 		rightEqCols:  []uint32{0},
-	})
+	}
+	tc.init()
+	spec := createSpecForHashJoiner(tc)
 	var spilled bool
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
-	hj, accounts, monitors, err := createDiskBackedHashJoiner(
-		ctx, flowCtx, spec, []Operator{leftSource, rightSource},
+	sem := colexecbase.NewTestingSemaphore(externalHJMinPartitions)
+	// Ignore closers since the sorter should close itself when it is drained of
+	// all tuples. We assert this by checking that the semaphore reports a count
+	// of 0.
+	hj, accounts, monitors, _, err := createDiskBackedHashJoiner(
+		ctx, flowCtx, spec, []colexecbase.Operator{leftSource, rightSource},
 		func() { spilled = true }, queueCfg, 0 /* numForcedRepartitions */, true, /* delegateFDAcquisitions */
-		NewTestingSemaphore(externalHJMinPartitions),
+		sem,
 	)
 	defer func() {
-		for _, memAccount := range accounts {
-			memAccount.Close(ctx)
+		for _, acc := range accounts {
+			acc.Close(ctx)
 		}
-		for _, memMonitor := range monitors {
-			memMonitor.Stop(ctx)
+		for _, mon := range monitors {
+			mon.Stop(ctx)
 		}
 	}()
 	require.NoError(t, err)
@@ -173,6 +182,7 @@ func TestExternalHashJoinerFallbackToSortMergeJoin(t *testing.T) {
 	}
 	require.True(t, spilled)
 	require.Equal(t, expectedTuplesCount, actualTuplesCount)
+	require.Equal(t, 0, sem.GetCount())
 }
 
 func BenchmarkExternalHashJoiner(b *testing.B) {
@@ -182,13 +192,16 @@ func BenchmarkExternalHashJoiner(b *testing.B) {
 	defer evalCtx.Stop(ctx)
 	flowCtx := &execinfra.FlowCtx{
 		EvalCtx: &evalCtx,
-		Cfg:     &execinfra.ServerConfig{Settings: st},
+		Cfg: &execinfra.ServerConfig{
+			Settings:    st,
+			DiskMonitor: testDiskMonitor,
+		},
 	}
 	nCols := 4
-	sourceTypes := make([]coltypes.T, nCols)
+	sourceTypes := make([]*types.T, nCols)
 
 	for colIdx := 0; colIdx < nCols; colIdx++ {
-		sourceTypes[colIdx] = coltypes.Int64
+		sourceTypes[colIdx] = types.Int
 	}
 
 	batch := testAllocator.NewMemBatch(sourceTypes)
@@ -218,8 +231,8 @@ func BenchmarkExternalHashJoiner(b *testing.B) {
 		}
 		queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(b, false /* inMem */)
 		defer cleanup()
-		leftSource := newFiniteBatchSource(batch, 0)
-		rightSource := newFiniteBatchSource(batch, 0)
+		leftSource := newFiniteBatchSource(batch, sourceTypes, 0)
+		rightSource := newFiniteBatchSource(batch, sourceTypes, 0)
 		for _, fullOuter := range []bool{false, true} {
 			for _, nBatches := range []int{1 << 2, 1 << 7} {
 				for _, spillForced := range []bool{false, true} {
@@ -227,11 +240,11 @@ func BenchmarkExternalHashJoiner(b *testing.B) {
 					name := fmt.Sprintf(
 						"nulls=%t/fullOuter=%t/batches=%d/spillForced=%t",
 						hasNulls, fullOuter, nBatches, spillForced)
-					joinType := sqlbase.JoinType_INNER
+					joinType := sqlbase.InnerJoin
 					if fullOuter {
-						joinType = sqlbase.JoinType_FULL_OUTER
+						joinType = sqlbase.FullOuterJoin
 					}
-					spec := createSpecForHashJoiner(joinTestCase{
+					tc := &joinTestCase{
 						joinType:     joinType,
 						leftTypes:    sourceTypes,
 						leftOutCols:  []uint32{0, 1},
@@ -239,7 +252,9 @@ func BenchmarkExternalHashJoiner(b *testing.B) {
 						rightTypes:   sourceTypes,
 						rightOutCols: []uint32{2, 3},
 						rightEqCols:  []uint32{0, 1},
-					})
+					}
+					tc.init()
+					spec := createSpecForHashJoiner(tc)
 					b.Run(name, func(b *testing.B) {
 						// 8 (bytes / int64) * nBatches (number of batches) * col.BatchSize() (rows /
 						// batch) * nCols (number of columns / row) * 2 (number of sources).
@@ -248,10 +263,10 @@ func BenchmarkExternalHashJoiner(b *testing.B) {
 						for i := 0; i < b.N; i++ {
 							leftSource.reset(nBatches)
 							rightSource.reset(nBatches)
-							hj, accounts, monitors, err := createDiskBackedHashJoiner(
-								ctx, flowCtx, spec, []Operator{leftSource, rightSource},
+							hj, accounts, monitors, _, err := createDiskBackedHashJoiner(
+								ctx, flowCtx, spec, []colexecbase.Operator{leftSource, rightSource},
 								func() {}, queueCfg, 0 /* numForcedRepartitions */, false, /* delegateFDAcquisitions */
-								NewTestingSemaphore(VecMaxOpenFDsLimit),
+								colexecbase.NewTestingSemaphore(VecMaxOpenFDsLimit),
 							)
 							memAccounts = append(memAccounts, accounts...)
 							memMonitors = append(memMonitors, monitors...)
@@ -282,13 +297,13 @@ func createDiskBackedHashJoiner(
 	ctx context.Context,
 	flowCtx *execinfra.FlowCtx,
 	spec *execinfrapb.ProcessorSpec,
-	inputs []Operator,
+	inputs []colexecbase.Operator,
 	spillingCallbackFn func(),
 	diskQueueCfg colcontainer.DiskQueueCfg,
 	numForcedRepartitions int,
 	delegateFDAcquisitions bool,
 	testingSemaphore semaphore.Semaphore,
-) (Operator, []*mon.BoundAccount, []*mon.BytesMonitor, error) {
+) (colexecbase.Operator, []*mon.BoundAccount, []*mon.BytesMonitor, []IdempotentCloser, error) {
 	args := NewColOperatorArgs{
 		Spec:                spec,
 		Inputs:              inputs,
@@ -303,5 +318,5 @@ func createDiskBackedHashJoiner(
 	args.TestingKnobs.NumForcedRepartitions = numForcedRepartitions
 	args.TestingKnobs.DelegateFDAcquisitions = delegateFDAcquisitions
 	result, err := NewColOperator(ctx, flowCtx, args)
-	return result.Op, result.BufferingOpMemAccounts, result.BufferingOpMemMonitors, err
+	return result.Op, result.OpAccounts, result.OpMonitors, result.ToClose, err
 }

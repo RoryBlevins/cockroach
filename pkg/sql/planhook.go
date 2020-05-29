@@ -13,6 +13,8 @@ package sql
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/resolver"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -67,44 +69,32 @@ func (p *planner) RunParams(ctx context.Context) runParams {
 // CCL statements to get access to a "planner" is through this PlanHookState
 // that gets passed back due to this inversion of roles.
 type PlanHookState interface {
-	SchemaResolver
+	resolver.SchemaResolver
 	RunParams(ctx context.Context) runParams
 	ExtendedEvalContext() *extendedEvalContext
 	SessionData() *sessiondata.SessionData
 	ExecCfg() *ExecutorConfig
 	DistSQLPlanner() *DistSQLPlanner
-	LeaseMgr() *LeaseManager
-	TypeAsString(e tree.Expr, op string) (func() (string, error), error)
-	TypeAsStringArray(e tree.Exprs, op string) (func() ([]string, error), error)
+	LeaseMgr() *lease.Manager
+	TypeAsString(ctx context.Context, e tree.Expr, op string) (func() (string, error), error)
+	TypeAsStringArray(ctx context.Context, e tree.Exprs, op string) (func() ([]string, error), error)
 	TypeAsStringOpts(
-		opts tree.KVOptions, optsValidate map[string]KVStringOptValidate,
+		ctx context.Context, opts tree.KVOptions, optsValidate map[string]KVStringOptValidate,
 	) (func() (map[string]string, error), error)
 	User() string
 	AuthorizationAccessor
 	// The role create/drop call into OSS code to reuse plan nodes.
 	// TODO(mberhault): it would be easier to just pass a planner to plan hooks.
-	CreateRoleNode(
-		ctx context.Context, nameE tree.Expr, ifNotExists bool,
-		isRole bool, opName string, kvOptions tree.KVOptions,
-	) (*CreateRoleNode, error)
-	AlterRoleNode(
-		ctx context.Context, nameE tree.Expr, ifExists bool, isRole bool,
-		opName string, kvOptions tree.KVOptions,
-	) (*alterRoleNode, error)
-	DropRoleNode(
-		ctx context.Context, namesE tree.Exprs, ifExists bool, isRole bool,
-		opName string,
-	) (*DropRoleNode, error)
 	GetAllRoles(ctx context.Context) (map[string]bool, error)
 	BumpRoleMembershipTableVersion(ctx context.Context) error
-	EvalAsOfTimestamp(asOf tree.AsOfClause) (hlc.Timestamp, error)
+	EvalAsOfTimestamp(ctx context.Context, asOf tree.AsOfClause) (hlc.Timestamp, error)
 	ResolveUncachedDatabaseByName(
 		ctx context.Context, dbName string, required bool) (*UncachedDatabaseDescriptor, error)
 	ResolveMutableTableDescriptor(
-		ctx context.Context, tn *ObjectName, required bool, requiredType ResolveRequiredType,
+		ctx context.Context, tn *TableName, required bool, requiredType resolver.ResolveRequiredType,
 	) (table *MutableTableDescriptor, err error)
 	ShowCreate(
-		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.TableDescriptor, ignoreFKs shouldOmitFKClausesFromCreate,
+		ctx context.Context, dbPrefix string, allDescs []sqlbase.Descriptor, desc *sqlbase.TableDescriptor, displayOptions ShowCreateDisplayOptions,
 	) (string, error)
 }
 
@@ -121,14 +111,6 @@ func AddPlanHook(f planHookFn) {
 // were registered.
 func ClearPlanHooks() {
 	planHooks = nil
-}
-
-// AddWrappedPlanHook adds a hook used to short-circuit creating a planNode from a
-// tree.Statement. If the returned plan is non-nil, it is used directly by the planner.
-//
-// See PlanHookState comments for information about why plan hooks are needed.
-func AddWrappedPlanHook(f wrappedPlanHookFn) {
-	wrappedPlanHooks = append(wrappedPlanHooks, f)
 }
 
 // hookFnNode is a planNode implemented in terms of a function. It begins the

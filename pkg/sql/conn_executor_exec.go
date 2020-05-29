@@ -20,7 +20,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/lease"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
@@ -28,6 +31,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/fsm"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -37,28 +41,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/opentracing/opentracing-go"
 )
-
-// NoticesEnabled is the cluster setting that allows users
-// to enable notices.
-var NoticesEnabled = settings.RegisterPublicBoolSetting(
-	"sql.notices.enabled",
-	"enable notices in the server/client protocol being sent",
-	true,
-)
-
-// gatedNoticeSender is a noticeSender which can be gated by a cluster setting.
-type gatedNoticeSender struct {
-	noticeSender
-	sv *settings.Values
-}
-
-// AppendNotice implements the noticeSender interface.
-func (s *gatedNoticeSender) AppendNotice(notice error) {
-	if !NoticesEnabled.Get(s.sv) {
-		return
-	}
-	s.noticeSender.AppendNotice(notice)
-}
 
 // execStmt executes one statement by dispatching according to the current
 // state. Returns an Event to be passed to the state machine, or nil if no
@@ -165,7 +147,7 @@ func (ex *connExecutor) execStmtInOpenState(
 
 	// Canceling a query cancels its transaction's context so we take a reference
 	// to the cancelation function here.
-	unregisterFn := ex.addActiveQuery(stmt.queryID, stmt.AST, ex.state.cancel)
+	unregisterFn := ex.addActiveQuery(stmt.queryID, stmt, ex.state.cancel)
 
 	// queryDone is a cleanup function dealing with unregistering a query.
 	// It also deals with overwriting res.Error to a more user-friendly message in
@@ -203,46 +185,67 @@ func (ex *connExecutor) execStmtInOpenState(
 		}
 	}()
 
-	var discardRows bool
-	var stmtDiagPlan *planTop
+	p := &ex.planner
+	stmtTS := ex.server.cfg.Clock.PhysicalTime()
+	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
+	ex.resetPlanner(ctx, p, ex.state.mu.txn, stmtTS)
+	p.sessionDataMutator.paramStatusUpdater = res
+	p.noticeSender = res
+
 	var shouldCollectDiagnostics bool
-	var diagHelper *stmtDiagnosticsHelper
+	var finishCollectionDiagnostics StmtDiagnosticsTraceFinishFunc
 
-	if explainBundle, ok := stmt.AST.(*tree.ExplainBundle); ok {
-		// Always collect diagnostics for EXPLAIN BUNDLE.
+	if explainBundle, ok := stmt.AST.(*tree.ExplainAnalyzeDebug); ok {
+		telemetry.Inc(sqltelemetry.ExplainAnalyzeDebugUseCounter)
+		// Always collect diagnostics for EXPLAIN ANALYZE (DEBUG).
 		shouldCollectDiagnostics = true
-		// Strip off EXPLAIN BUNDLE to execute the inner statement.
+		// Strip off the explain node to execute the inner statement.
 		stmt.AST = explainBundle.Statement
-		// TODO(radu): should we trim the "EXPLAIN BUNDLE" part from stmt.SQL?
+		// TODO(radu): should we trim the "EXPLAIN ANALYZE (DEBUG)" part from
+		// stmt.SQL?
 
-		// EXPLAIN BUNDLE does not return the rows for the given query; instead it
-		// returns some text which includes a URL.
+		// Clear any ExpectedTypes we set if we prepared this statement (they
+		// reflect the column types of the EXPLAIN itself and not those of the inner
+		// statement).
+		stmt.ExpectedTypes = nil
+
+		// EXPLAIN ANALYZE (DEBUG) does not return the rows for the given query;
+		// instead it returns some text which includes a URL.
 		// TODO(radu): maybe capture some of the rows and include them in the
 		// bundle.
-		discardRows = true
+		p.discardRows = true
 	} else {
-		shouldCollectDiagnostics, diagHelper = ex.stmtInfoRegistry.shouldCollectDiagnostics(ctx, stmt.AST)
+		shouldCollectDiagnostics, finishCollectionDiagnostics = ex.stmtDiagnosticsRecorder.ShouldCollectDiagnostics(ctx, stmt.AST)
+		if shouldCollectDiagnostics {
+			telemetry.Inc(sqltelemetry.StatementDiagnosticsCollectedCounter)
+		}
 	}
 
 	if shouldCollectDiagnostics {
+		p.collectBundle = true
 		tr := ex.server.cfg.AmbientCtx.Tracer
 		origCtx := ctx
 		var sp opentracing.Span
 		ctx, sp = tracing.StartSnowballTrace(ctx, tr, "traced statement")
+		// TODO(radu): consider removing this if/when #46164 is addressed.
+		p.extendedEvalCtx.Context = ctx
 		defer func() {
 			// Record the statement information that we've collected.
 			// Note that in case of implicit transactions, the trace contains the auto-commit too.
 			sp.Finish()
 			trace := tracing.GetRecording(sp)
-
-			if diagHelper != nil {
-				diagHelper.Finish(origCtx, trace, stmtDiagPlan)
+			ie := p.extendedEvalCtx.InternalExecutor.(*InternalExecutor)
+			if finishCollectionDiagnostics != nil {
+				bundle, collectionErr := buildStatementBundle(
+					origCtx, ex.server.cfg.DB, ie, &p.curPlan, trace,
+				)
+				finishCollectionDiagnostics(origCtx, bundle.trace, bundle.zip, collectionErr)
 			} else {
-				// Handle EXPLAIN BUNDLE.
+				// Handle EXPLAIN ANALYZE (DEBUG).
 				// If there was a communication error, no point in setting any results.
 				if retErr == nil {
 					retErr = setExplainBundleResult(
-						origCtx, res, stmt.AST, trace, stmtDiagPlan, ex.server.cfg,
+						origCtx, res, stmt.AST, trace, &p.curPlan, ie, ex.server.cfg,
 					)
 				}
 			}
@@ -329,7 +332,11 @@ func (ex *connExecutor) execStmtInOpenState(
 			}
 			typeHints = make(tree.PlaceholderTypes, stmt.NumPlaceholders)
 			for i, t := range s.Types {
-				typeHints[i] = t
+				resolved, err := tree.ResolveType(ctx, t, ex.planner.semaCtx.GetTypeResolver())
+				if err != nil {
+					return makeErrEvent(err)
+				}
+				typeHints[i] = resolved
 			}
 		}
 		if _, err := ex.addPreparedStmt(
@@ -366,7 +373,7 @@ func (ex *connExecutor) execStmtInOpenState(
 			return makeErrEvent(err)
 		}
 		var err error
-		pinfo, err = fillInPlaceholders(ps, name, s.Params, ex.sessionData.SearchPath)
+		pinfo, err = fillInPlaceholders(ctx, ps, name, s.Params, ex.sessionData.SearchPath)
 		if err != nil {
 			return makeErrEvent(err)
 		}
@@ -377,22 +384,18 @@ func (ex *connExecutor) execStmtInOpenState(
 		stmt.AnonymizedStr = ps.AnonymizedStr
 		res.ResetStmtType(ps.AST)
 
-		discardRows = discardRows || s.DiscardRows
+		if s.DiscardRows {
+			p.discardRows = true
+		}
 	}
+
+	p.semaCtx.Annotations = tree.MakeAnnotations(stmt.NumAnnotations)
 
 	// For regular statements (the ones that get to this point), we
 	// don't return any event unless an error happens.
 
-	p := &ex.planner
-	stmtTS := ex.server.cfg.Clock.PhysicalTime()
-	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
-	ex.resetPlanner(ctx, p, ex.state.mu.txn, stmtTS, stmt.NumAnnotations)
-	p.sessionDataMutator.paramStatusUpdater = res
-	p.noticeSender = &gatedNoticeSender{noticeSender: res, sv: &ex.server.cfg.Settings.SV}
-	stmtDiagPlan = &p.curPlan
-
 	if os.ImplicitTxn.Get() {
-		asOfTs, err := p.isAsOf(stmt.AST)
+		asOfTs, err := p.isAsOf(ctx, stmt.AST)
 		if err != nil {
 			return makeErrEvent(err)
 		}
@@ -406,7 +409,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		// the transaction's timestamp. This is useful for running AOST statements
 		// using the InternalExecutor inside an external transaction; one might want
 		// to do that to force p.avoidCachedDescriptors to be set below.
-		ts, err := p.isAsOf(stmt.AST)
+		ts, err := p.isAsOf(ctx, stmt.AST)
 		if err != nil {
 			return makeErrEvent(err)
 		}
@@ -480,10 +483,8 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
 	ex.phaseTimes[plannerStartExecStmt] = timeutil.Now()
 	p.stmt = &stmt
-	p.discardRows = discardRows
 	p.cancelChecker = sqlbase.NewCancelChecker(ctx)
 	p.autoCommit = os.ImplicitTxn.Get() && !ex.server.cfg.TestingKnobs.DisableAutoCommit
-	p.collectBundle = shouldCollectDiagnostics
 	if err := ex.dispatchToExecutionEngine(ctx, p, res); err != nil {
 		return nil, nil, err
 	}
@@ -544,7 +545,7 @@ func (ex *connExecutor) execStmtInOpenState(
 // executor's table leases after the txn commits so that schema changes can
 // proceed.
 func (ex *connExecutor) checkTableTwoVersionInvariant(ctx context.Context) error {
-	tables := ex.extraTxnState.tables.getTablesWithNewVersion()
+	tables := ex.extraTxnState.descCollection.GetTablesWithNewVersion()
 	if tables == nil {
 		return nil
 	}
@@ -568,13 +569,13 @@ func (ex *connExecutor) checkTableTwoVersionInvariant(ctx context.Context) error
 	// All this being said, we must retain our leases on tables which we have
 	// not modified to ensure that our writes to those other tables in this
 	// transaction remain valid.
-	ex.extraTxnState.tables.releaseTableLeases(ctx, tables)
+	ex.extraTxnState.descCollection.ReleaseTableLeases(ctx, tables)
 
 	// We know that so long as there are no leases on the updated tables as of
 	// the current provisional commit timestamp for this transaction then if this
 	// transaction ends up committing then there won't have been any created
 	// in the meantime.
-	count, err := CountLeases(ctx, ex.server.cfg.InternalExecutor, tables, txn.ProvisionalCommitTimestamp())
+	count, err := lease.CountLeases(ctx, ex.server.cfg.InternalExecutor, tables, txn.ProvisionalCommitTimestamp())
 	if err != nil {
 		return err
 	}
@@ -603,13 +604,13 @@ func (ex *connExecutor) checkTableTwoVersionInvariant(ctx context.Context) error
 	txn.CleanupOnError(ctx, retryErr)
 	// Release the rest of our leases on unmodified tables so we don't hold up
 	// schema changes there and potentially create a deadlock.
-	ex.extraTxnState.tables.releaseLeases(ctx)
+	ex.extraTxnState.descCollection.ReleaseLeases(ctx)
 
 	// Wait until all older version leases have been released or expired.
 	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
 		// Use the current clock time.
 		now := ex.server.cfg.Clock.Now()
-		count, err := CountLeases(ctx, ex.server.cfg.InternalExecutor, tables, now)
+		count, err := lease.CountLeases(ctx, ex.server.cfg.InternalExecutor, tables, now)
 		if err != nil {
 			return err
 		}
@@ -623,7 +624,7 @@ func (ex *connExecutor) checkTableTwoVersionInvariant(ctx context.Context) error
 
 	// Create a new transaction to retry with a higher timestamp than the
 	// timestamps used in the retry loop above.
-	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db, ex.transitionCtx.nodeID)
+	ex.state.mu.txn = kv.NewTxnWithSteppingEnabled(ctx, ex.transitionCtx.db, ex.transitionCtx.nodeIDOrZero)
 	if err := ex.state.mu.txn.SetUserPriority(userPriority); err != nil {
 		return err
 	}
@@ -647,7 +648,7 @@ func (ex *connExecutor) commitSQLTransaction(
 func (ex *connExecutor) commitSQLTransactionInternal(
 	ctx context.Context, stmt tree.Statement,
 ) error {
-	if err := ex.extraTxnState.tables.validatePrimaryKeys(); err != nil {
+	if err := validatePrimaryKeys(&ex.extraTxnState.descCollection); err != nil {
 		return err
 	}
 
@@ -662,8 +663,25 @@ func (ex *connExecutor) commitSQLTransactionInternal(
 	// Now that we've committed, if we modified any table we need to make sure
 	// to release the leases for them so that the schema change can proceed and
 	// we don't block the client.
-	if tables := ex.extraTxnState.tables.getTablesWithNewVersion(); tables != nil {
-		ex.extraTxnState.tables.releaseLeases(ctx)
+	if tables := ex.extraTxnState.descCollection.GetTablesWithNewVersion(); tables != nil {
+		ex.extraTxnState.descCollection.ReleaseLeases(ctx)
+	}
+	return nil
+}
+
+// validatePrimaryKeys verifies that all tables modified in the transaction have
+// an enabled primary key after potentially undergoing DROP PRIMARY KEY, which
+// is required to be followed by ADD PRIMARY KEY.
+func validatePrimaryKeys(tc *descs.Collection) error {
+	modifiedTables := tc.GetTablesWithNewVersion()
+	for i := range modifiedTables {
+		table := tc.GetUncommittedTableByID(modifiedTables[i].ID).MutableTableDescriptor
+		if !table.HasPrimaryKey() {
+			return unimplemented.NewWithIssuef(48026,
+				"primary key of table %s dropped without subsequent addition of new primary key",
+				table.Name,
+			)
+		}
 	}
 	return nil
 }
@@ -731,7 +749,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 
 	var cols sqlbase.ResultColumns
 	if stmt.AST.StatementType() == tree.Rows {
-		cols = planColumns(planner.curPlan.plan)
+		cols = planColumns(planner.curPlan.main)
 	}
 	if err := ex.initStatementResult(ctx, res, stmt, cols); err != nil {
 		res.SetError(err)
@@ -739,9 +757,9 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	}
 
 	ex.sessionTracing.TracePlanCheckStart(ctx)
-	distributePlan := false
-	distributePlan = shouldDistributePlan(
-		ctx, ex.sessionData.DistSQLMode, ex.server.cfg.DistSQLPlanner, planner.curPlan.plan)
+	distributePlan := willDistributePlan(
+		ctx, planner.execCfg.NodeID, ex.sessionData.DistSQLMode, planner.curPlan.main,
+	)
 	ex.sessionTracing.TracePlanCheckEnd(ctx, nil, distributePlan)
 
 	if ex.server.cfg.TestingKnobs.BeforeExecute != nil {
@@ -796,8 +814,8 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	return err
 }
 
-// makeExecPlan creates an execution plan and populates planner.curPlan, using
-// either the optimizer or the heuristic planner.
+// makeExecPlan creates an execution plan and populates planner.curPlan using
+// the cost-based optimizer.
 func (ex *connExecutor) makeExecPlan(ctx context.Context, planner *planner) error {
 	planner.curPlan.init(planner.stmt, ex.appStats)
 	if planner.collectBundle {
@@ -835,7 +853,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		ex.server.cfg.RangeDescriptorCache, ex.server.cfg.LeaseHolderCache,
 		planner.txn,
 		func(ts hlc.Timestamp) {
-			_ = ex.server.cfg.Clock.Update(ts)
+			ex.server.cfg.Clock.Update(ts)
 		},
 		&ex.sessionTracing,
 	)
@@ -852,16 +870,29 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	planCtx.isLocal = !distribute
 	planCtx.planner = planner
 	planCtx.stmtType = recv.stmtType
+	if planner.collectBundle {
+		planCtx.saveDiagram = func(diagram execinfrapb.FlowDiagram) {
+			planner.curPlan.distSQLDiagrams = append(planner.curPlan.distSQLDiagrams, diagram)
+		}
+	}
 
 	var evalCtxFactory func() *extendedEvalContext
-	if len(planner.curPlan.subqueryPlans) != 0 || len(planner.curPlan.postqueryPlans) != 0 {
-		var evalCtx extendedEvalContext
-		ex.initEvalCtx(ctx, &evalCtx, planner)
+	if len(planner.curPlan.subqueryPlans) != 0 ||
+		len(planner.curPlan.cascades) != 0 ||
+		len(planner.curPlan.checkPlans) != 0 {
+		// The factory reuses the same object because the contexts are not used
+		// concurrently.
+		var factoryEvalCtx extendedEvalContext
+		ex.initEvalCtx(ctx, &factoryEvalCtx, planner)
 		evalCtxFactory = func() *extendedEvalContext {
-			ex.resetEvalCtx(&evalCtx, planner.txn, planner.ExtendedEvalContext().StmtTimestamp)
-			evalCtx.Placeholders = &planner.semaCtx.Placeholders
-			evalCtx.Annotations = &planner.semaCtx.Annotations
-			return &evalCtx
+			ex.resetEvalCtx(&factoryEvalCtx, planner.txn, planner.ExtendedEvalContext().StmtTimestamp)
+			factoryEvalCtx.Placeholders = &planner.semaCtx.Placeholders
+			factoryEvalCtx.Annotations = &planner.semaCtx.Annotations
+			// Query diagnostics can change the Context; make sure we are using the
+			// same one.
+			// TODO(radu): consider removing this if/when #46164 is addressed.
+			factoryEvalCtx.Context = evalCtx.Context
+			return &factoryEvalCtx
 		}
 	}
 
@@ -876,7 +907,7 @@ func (ex *connExecutor) execWithDistSQLEngine(
 	// We pass in whether or not we wanted to distribute this plan, which tells
 	// the planner whether or not to plan remote table readers.
 	cleanup := ex.server.cfg.DistSQLPlanner.PlanAndRun(
-		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.plan, recv,
+		ctx, evalCtx, planCtx, planner.txn, planner.curPlan.main, recv,
 	)
 	// Note that we're not cleaning up right away because postqueries might
 	// need to have access to the main query tree.
@@ -885,11 +916,9 @@ func (ex *connExecutor) execWithDistSQLEngine(
 		return recv.bytesRead, recv.rowsRead, recv.commErr
 	}
 
-	if len(planner.curPlan.postqueryPlans) != 0 {
-		ex.server.cfg.DistSQLPlanner.PlanAndRunPostqueries(
-			ctx, planner, evalCtxFactory, planner.curPlan.postqueryPlans, recv, distribute,
-		)
-	}
+	ex.server.cfg.DistSQLPlanner.PlanAndRunCascadesAndChecks(
+		ctx, planner, evalCtxFactory, &planner.curPlan.planComponents, recv, distribute,
+	)
 
 	return recv.bytesRead, recv.rowsRead, recv.commErr
 }
@@ -911,15 +940,15 @@ func (ex *connExecutor) beginTransactionTimestampsAndReadMode(
 	historicalTimestamp *hlc.Timestamp,
 	err error,
 ) {
-	now := ex.server.cfg.Clock.Now()
+	now := ex.server.cfg.Clock.PhysicalTime()
 	if s.Modes.AsOf.Expr == nil {
 		rwMode = ex.readWriteModeWithSessionDefault(s.Modes.ReadWriteMode)
-		return rwMode, now.GoTime(), nil, nil
+		return rwMode, now, nil, nil
 	}
 	ex.statsCollector.reset(&ex.server.sqlStats, ex.appStats, &ex.phaseTimes)
 	p := &ex.planner
-	ex.resetPlanner(ctx, p, nil /* txn */, now.GoTime(), 0 /* numAnnotations */)
-	ts, err := p.EvalAsOfTimestamp(s.Modes.AsOf)
+	ex.resetPlanner(ctx, p, nil /* txn */, now)
+	ts, err := p.EvalAsOfTimestamp(ctx, s.Modes.AsOf)
 	if err != nil {
 		return 0, time.Time{}, nil, err
 	}
@@ -954,34 +983,28 @@ func (ex *connExecutor) execStmtInNoTxnState(
 				ex.incrementExecutedStmtCounter(stmt)
 			}
 		}()
-		pri, err := priorityToProto(s.Modes.UserPriority)
-		if err != nil {
-			return ex.makeErrEvent(err, s)
-		}
 		mode, sqlTs, historicalTs, err := ex.beginTransactionTimestampsAndReadMode(ctx, s)
 		if err != nil {
 			return ex.makeErrEvent(err, s)
 		}
 		return eventTxnStart{ImplicitTxn: fsm.False},
 			makeEventTxnStartPayload(
-				pri, mode, sqlTs,
+				ex.txnPriorityWithSessionDefault(s.Modes.UserPriority),
+				mode,
+				sqlTs,
 				historicalTs,
 				ex.transitionCtx)
 	case *tree.CommitTransaction, *tree.ReleaseSavepoint,
 		*tree.RollbackTransaction, *tree.SetTransaction, *tree.Savepoint:
 		return ex.makeErrEvent(errNoTransactionInProgress, stmt.AST)
 	default:
-		mode := tree.ReadWrite
-		if ex.sessionData.DefaultReadOnly {
-			mode = tree.ReadOnly
-		}
 		// NB: Implicit transactions are created without a historical timestamp even
 		// though the statement might contain an AOST clause. In these cases the
 		// clause is evaluated and applied execStmtInOpenState.
 		return eventTxnStart{ImplicitTxn: fsm.True},
 			makeEventTxnStartPayload(
-				roachpb.NormalUserPriority,
-				mode,
+				ex.txnPriorityWithSessionDefault(tree.UnspecifiedUserPriority),
+				ex.readWriteModeWithSessionDefault(tree.UnspecifiedReadWriteMode),
 				ex.server.cfg.Clock.PhysicalTime(),
 				nil, /* historicalTimestamp */
 				ex.transitionCtx)
@@ -995,7 +1018,13 @@ func (ex *connExecutor) execStmtInNoTxnState(
 //   allowing it to be retried.
 func (ex *connExecutor) execStmtInAbortedState(
 	ctx context.Context, stmt Statement, res RestrictedCommandResult,
-) (fsm.Event, fsm.EventPayload) {
+) (_ fsm.Event, payload fsm.EventPayload) {
+	ex.incrementStartedStmtCounter(stmt)
+	defer func() {
+		if !payloadHasError(payload) {
+			ex.incrementExecutedStmtCounter(stmt)
+		}
+	}()
 
 	reject := func() (fsm.Event, fsm.EventPayload) {
 		ev := eventNonRetriableErr{IsCommit: fsm.False}
@@ -1189,13 +1218,14 @@ func (ex *connExecutor) enableTracing(modes []string) error {
 // longer executing. NOTE(andrei): As of Feb 2018, "executing" does not imply
 // that the results have been delivered to the client.
 func (ex *connExecutor) addActiveQuery(
-	queryID ClusterWideID, stmt tree.Statement, cancelFun context.CancelFunc,
+	queryID ClusterWideID, stmt Statement, cancelFun context.CancelFunc,
 ) func() {
 
-	_, hidden := stmt.(tree.HiddenFromShowQueries)
+	_, hidden := stmt.AST.(tree.HiddenFromShowQueries)
 	qm := &queryMeta{
+		txnID:         ex.state.mu.txn.ID(),
 		start:         ex.phaseTimes[sessionQueryReceived],
-		stmt:          stmt,
+		rawStmt:       stmt.SQL,
 		phase:         preparing,
 		isDistributed: false,
 		ctxCancel:     cancelFun,
@@ -1212,7 +1242,7 @@ func (ex *connExecutor) addActiveQuery(
 			panic(fmt.Sprintf("query %d missing from ActiveQueries", queryID))
 		}
 		delete(ex.mu.ActiveQueries, queryID)
-		ex.mu.LastActiveQuery = qm.stmt
+		ex.mu.LastActiveQuery = stmt.AST
 
 		ex.mu.Unlock()
 	}
@@ -1276,20 +1306,15 @@ func payloadHasError(payload fsm.EventPayload) bool {
 // recordTransactionStart records the start of the transaction and returns a
 // closure to be called once the transaction finishes.
 func (ex *connExecutor) recordTransactionStart() func(txnEvent) {
-	// We don't need to write down the transaction start time into
-	// ex.statsCollector.phaseTimes because it will be overwritten in
-	// ex.statsCollector.reset() before executing the statements of the
-	// transaction.
-	ex.phaseTimes[transactionStart] = timeutil.Now()
+	ex.state.mu.RLock()
+	txnStart := ex.state.mu.txnStart
+	ex.state.mu.RUnlock()
 	implicit := ex.implicitTxn()
-	return func(ev txnEvent) { ex.recordTransaction(ev, implicit) }
+	return func(ev txnEvent) { ex.recordTransaction(ev, implicit, txnStart) }
 }
 
-func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool) {
-	phaseTimes := &ex.statsCollector.phaseTimes
-	phaseTimes[transactionEnd] = timeutil.Now()
-	txnStart := phaseTimes[transactionStart]
-	txnEnd := phaseTimes[transactionEnd]
+func (ex *connExecutor) recordTransaction(ev txnEvent, implicit bool, txnStart time.Time) {
+	txnEnd := timeutil.Now()
 	txnTime := txnEnd.Sub(txnStart)
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(txnTime.Nanoseconds())
 	ex.statsCollector.recordTransaction(

@@ -64,11 +64,15 @@ type DropIndex struct {
 	IndexList    TableIndexNames
 	IfExists     bool
 	DropBehavior DropBehavior
+	Concurrently bool
 }
 
 // Format implements the NodeFormatter interface.
 func (node *DropIndex) Format(ctx *FmtCtx) {
 	ctx.WriteString("DROP INDEX ")
+	if node.Concurrently {
+		ctx.WriteString("CONCURRENTLY ")
+	}
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
 	}
@@ -148,25 +152,41 @@ type DropRole struct {
 
 // Format implements the NodeFormatter interface.
 func (node *DropRole) Format(ctx *FmtCtx) {
-	ctx.WriteString("DROP ROLE ")
+	ctx.WriteString("DROP")
+	if node.IsRole {
+		ctx.WriteString(" ROLE ")
+	} else {
+		ctx.WriteString(" USER ")
+	}
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
 	}
 	ctx.FormatNode(&node.Names)
 }
 
-// DropUser is an alias for DropRole.
-type DropUser struct {
-	Names    Exprs
-	IsRole   bool
-	IfExists bool
+// DropType represents a DROP TYPE command.
+type DropType struct {
+	Names        []*UnresolvedObjectName
+	IfExists     bool
+	DropBehavior DropBehavior
 }
+
+var _ Statement = &DropType{}
 
 // Format implements the NodeFormatter interface.
-func (node *DropUser) Format(ctx *FmtCtx) {
-	ctx.WriteString("DROP USER ")
+func (node *DropType) Format(ctx *FmtCtx) {
+	ctx.WriteString("DROP TYPE ")
 	if node.IfExists {
 		ctx.WriteString("IF EXISTS ")
 	}
-	ctx.FormatNode(&node.Names)
+	for i := range node.Names {
+		if i > 0 {
+			ctx.WriteString(", ")
+		}
+		ctx.FormatNode(node.Names[i])
+	}
+	if node.DropBehavior != DropDefault {
+		ctx.WriteByte(' ')
+		ctx.WriteString(node.DropBehavior.String())
+	}
 }

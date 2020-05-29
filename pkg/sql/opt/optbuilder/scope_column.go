@@ -11,6 +11,8 @@
 package optbuilder
 
 import (
+	"context"
+
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -103,7 +105,7 @@ func (c *scopeColumn) Format(ctx *tree.FmtCtx) {
 		return
 	}
 
-	if ctx.HasFlags(tree.FmtShowTableAliases) && c.table.TableName != "" {
+	if ctx.HasFlags(tree.FmtShowTableAliases) && c.table.ObjectName != "" {
 		if c.table.ExplicitSchema && c.table.SchemaName != "" {
 			if c.table.ExplicitCatalog && c.table.CatalogName != "" {
 				ctx.FormatNode(&c.table.CatalogName)
@@ -113,7 +115,7 @@ func (c *scopeColumn) Format(ctx *tree.FmtCtx) {
 			ctx.WriteByte('.')
 		}
 
-		ctx.FormatNode(&c.table.TableName)
+		ctx.FormatNode(&c.table.ObjectName)
 		ctx.WriteByte('.')
 	}
 	ctx.FormatNode(&c.name)
@@ -125,7 +127,9 @@ func (c *scopeColumn) Walk(v tree.Visitor) tree.Expr {
 }
 
 // TypeCheck is part of the tree.Expr interface.
-func (c *scopeColumn) TypeCheck(_ *tree.SemaContext, desired *types.T) (tree.TypedExpr, error) {
+func (c *scopeColumn) TypeCheck(
+	_ context.Context, _ *tree.SemaContext, desired *types.T,
+) (tree.TypedExpr, error) {
 	return c, nil
 }
 

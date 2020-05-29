@@ -34,6 +34,7 @@ func TestFlatten(t *testing.T) {
 				t.CheckEqual(e.Message, "woo")
 				// Errors without code flatten to Uncategorized.
 				t.CheckEqual(e.Code, pgcode.Uncategorized)
+				t.CheckEqual(e.Severity, "ERROR")
 			},
 		},
 		{
@@ -41,6 +42,13 @@ func TestFlatten(t *testing.T) {
 			func(t testutils.T, e *pgerror.Error) {
 				t.CheckEqual(e.Message, "woo")
 				t.CheckEqual(e.Code, pgcode.Syntax)
+			},
+		},
+		{
+			pgerror.WithSeverity(baseErr, "DEBUG"),
+			func(t testutils.T, e *pgerror.Error) {
+				t.CheckEqual(e.Message, "woo")
+				t.CheckEqual(e.Severity, "DEBUG")
 			},
 		},
 		{
@@ -55,15 +63,6 @@ func TestFlatten(t *testing.T) {
 			func(t testutils.T, e *pgerror.Error) {
 				t.CheckEqual(e.Message, "woo")
 				t.CheckEqual(e.Detail, "My Detail")
-			},
-		},
-		{
-			// This case for backward compatibility with 19.1.
-			// Remove when the .TelemetryKey is removed from Error.
-			errors.WithTelemetry(baseErr, "My Key"),
-			func(t testutils.T, e *pgerror.Error) {
-				t.CheckEqual(e.Message, "woo")
-				t.CheckEqual(e.TelemetryKey, "My Key")
 			},
 		},
 		{

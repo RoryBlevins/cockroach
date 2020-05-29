@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/errors"
 )
 
 // Base config defaults.
@@ -62,6 +62,10 @@ const (
 	// leader lease active duration should be of the raft election timeout.
 	defaultRangeLeaseRaftElectionTimeoutMultiplier = 3
 
+	// NB: this can't easily become a variable as the UI hard-codes it to 10s.
+	// See https://github.com/cockroachdb/cockroach/issues/20310.
+	DefaultMetricsSampleInterval = 10 * time.Second
+
 	// defaultRPCHeartbeatInterval is the default value of RPCHeartbeatInterval
 	// used by the rpc context.
 	defaultRPCHeartbeatInterval = 3 * time.Second
@@ -95,6 +99,21 @@ const (
 	DefaultTableDescriptorLeaseRenewalTimeout = time.Minute
 )
 
+// DefaultHistogramWindowInterval returns the default rotation window for
+// histograms.
+func DefaultHistogramWindowInterval() time.Duration {
+	const defHWI = 6 * DefaultMetricsSampleInterval
+
+	// Rudimentary overflow detection; this can result if
+	// DefaultMetricsSampleInterval is set to an extremely large number, likely
+	// in the context of a test or an intentional attempt to disable metrics
+	// collection. Just return the default in this case.
+	if defHWI < DefaultMetricsSampleInterval {
+		return DefaultMetricsSampleInterval
+	}
+	return defHWI
+}
+
 var (
 	// defaultRaftElectionTimeoutTicks specifies the number of Raft Tick
 	// invocations that must pass between elections.
@@ -107,12 +126,12 @@ var (
 	// is responsible for ensuring the raft log doesn't grow without bound by
 	// making sure the leader doesn't get too far ahead.
 	defaultRaftLogTruncationThreshold = envutil.EnvOrDefaultInt64(
-		"COCKROACH_RAFT_LOG_TRUNCATION_THRESHOLD", 4<<20 /* 4 MB */)
+		"COCKROACH_RAFT_LOG_TRUNCATION_THRESHOLD", 8<<20 /* 8 MB */)
 
 	// defaultRaftMaxSizePerMsg specifies the maximum aggregate byte size of Raft
 	// log entries that a leader will send to followers in a single MsgApp.
 	defaultRaftMaxSizePerMsg = envutil.EnvOrDefaultInt(
-		"COCKROACH_RAFT_MAX_SIZE_PER_MSG", 16<<10 /* 16 KB */)
+		"COCKROACH_RAFT_MAX_SIZE_PER_MSG", 32<<10 /* 32 KB */)
 
 	// defaultRaftMaxSizeCommittedSizePerReady specifies the maximum aggregate
 	// byte size of the committed log entries which a node will receive in a
@@ -120,10 +139,10 @@ var (
 	defaultRaftMaxCommittedSizePerReady = envutil.EnvOrDefaultInt(
 		"COCKROACH_RAFT_MAX_COMMITTED_SIZE_PER_READY", 64<<20 /* 64 MB */)
 
-	// defaultRaftMaxSizePerMsg specifies how many "inflight" messages a leader
-	// will send to a follower without hearing a response.
+	// defaultRaftMaxInflightMsgs specifies how many "inflight" MsgApps a leader
+	// will send to a given follower without hearing a response.
 	defaultRaftMaxInflightMsgs = envutil.EnvOrDefaultInt(
-		"COCKROACH_RAFT_MAX_INFLIGHT_MSGS", 64)
+		"COCKROACH_RAFT_MAX_INFLIGHT_MSGS", 128)
 )
 
 type lazyHTTPClient struct {
@@ -190,6 +209,9 @@ type Config struct {
 	// HTTPAddr is the configured HTTP listen address.
 	HTTPAddr string
 
+	// DisableTLSForHTTP, if set, disables TLS for the HTTP listener.
+	DisableTLSForHTTP bool
+
 	// HTTPAdvertiseAddr is the advertised HTTP address.
 	// This is computed from HTTPAddr if specified otherwise Addr.
 	HTTPAdvertiseAddr string
@@ -200,20 +222,36 @@ type Config struct {
 	// httpClient uses the client TLS config. It is initialized lazily.
 	httpClient lazyHTTPClient
 
-	// HistogramWindowInterval is used to determine the approximate length of time
-	// that individual samples are retained in in-memory histograms. Currently,
-	// it is set to the arbitrary length of six times the Metrics sample interval.
-	// See the comment in server.Config for more details.
-	HistogramWindowInterval time.Duration
-
 	// RPCHeartbeatInterval controls how often a Ping request is sent on peer
 	// connections to determine connection health and update the local view
 	// of remote clocks.
 	RPCHeartbeatInterval time.Duration
+
+	// Enables the use of an PTP hardware clock user space API for HLC current time.
+	// This contains the path to the device to be used (i.e. /dev/ptp0)
+	ClockDevicePath string
+}
+
+// HistogramWindowInterval is used to determine the approximate length of time
+// that individual samples are retained in in-memory histograms. Currently,
+// it is set to the arbitrary length of six times the Metrics sample interval.
+//
+// The length of the window must be longer than the sampling interval due to
+// issue #12998, which was causing histograms to return zero values when sampled
+// because all samples had been evicted.
+//
+// Note that this is only intended to be a temporary fix for the above issue,
+// as our current handling of metric histograms have numerous additional
+// problems. These are tracked in github issue #7896, which has been given
+// a relatively high priority in light of recent confusion around histogram
+// metrics. For more information on the issues underlying our histogram system
+// and the proposed fixes, please see issue #7896.
+func (*Config) HistogramWindowInterval() time.Duration {
+	return DefaultHistogramWindowInterval()
 }
 
 func wrapError(err error) error {
-	if _, ok := err.(*security.Error); !ok {
+	if !errors.HasType(err, (*security.Error)(nil)) {
 		return &security.Error{
 			Message: "problem using security settings",
 			Err:     err,
@@ -230,6 +268,7 @@ func (cfg *Config) InitDefaults() {
 	cfg.Addr = defaultAddr
 	cfg.AdvertiseAddr = cfg.Addr
 	cfg.HTTPAddr = defaultHTTPAddr
+	cfg.DisableTLSForHTTP = false
 	cfg.HTTPAdvertiseAddr = ""
 	cfg.SplitListenSQL = false
 	cfg.SQLAddr = defaultSQLAddr
@@ -239,11 +278,13 @@ func (cfg *Config) InitDefaults() {
 	cfg.RPCHeartbeatInterval = defaultRPCHeartbeatInterval
 	cfg.ClusterName = ""
 	cfg.DisableClusterNameVerification = false
+	cfg.ClockDevicePath = ""
 }
 
-// HTTPRequestScheme returns "http" or "https" based on the value of Insecure.
+// HTTPRequestScheme returns "http" or "https" based on the value of
+// Insecure and DisableTLSForHTTP.
 func (cfg *Config) HTTPRequestScheme() string {
-	if cfg.Insecure {
+	if cfg.Insecure || cfg.DisableTLSForHTTP {
 		return httpScheme
 	}
 	return httpsScheme
@@ -257,8 +298,8 @@ func (cfg *Config) AdminURL() *url.URL {
 	}
 }
 
-// GetClientCertPaths returns the paths to the client cert and key.
-func (cfg *Config) GetClientCertPaths(user string) (string, string, error) {
+// getClientCertPaths returns the paths to the client cert and key.
+func (cfg *Config) getClientCertPaths(user string) (string, string, error) {
 	cm, err := cfg.GetCertificateManager()
 	if err != nil {
 		return "", "", err
@@ -266,8 +307,8 @@ func (cfg *Config) GetClientCertPaths(user string) (string, string, error) {
 	return cm.GetClientCertPaths(user)
 }
 
-// GetCACertPath returns the path to the CA certificate.
-func (cfg *Config) GetCACertPath() (string, error) {
+// getCACertPath returns the path to the CA certificate.
+func (cfg *Config) getCACertPath() (string, error) {
 	cm, err := cfg.GetCertificateManager()
 	if err != nil {
 		return "", err
@@ -294,7 +335,7 @@ func (cfg *Config) LoadSecurityOptions(options url.Values, username string) erro
 			// verify-ca and verify-full need a CA certificate.
 			if options.Get("sslrootcert") == "" {
 				// Fetch CA cert. This is required.
-				caCertPath, err := cfg.GetCACertPath()
+				caCertPath, err := cfg.getCACertPath()
 				if err != nil {
 					return wrapError(err)
 				}
@@ -306,7 +347,7 @@ func (cfg *Config) LoadSecurityOptions(options url.Values, username string) erro
 		}
 
 		// Fetch certs, but don't fail, we may be using a password.
-		certPath, keyPath, err := cfg.GetClientCertPaths(username)
+		certPath, keyPath, err := cfg.getClientCertPaths(username)
 		if err == nil {
 			if options.Get("sslcert") == "" {
 				options.Set("sslcert", certPath)
@@ -344,36 +385,6 @@ func (cfg *Config) GetCertificateManager() (*security.CertificateManager, error)
 	return cfg.certificateManager.cm, cfg.certificateManager.err
 }
 
-// InitializeNodeTLSConfigs tries to load client and server-side TLS configs.
-// It also enables the reload-on-SIGHUP functionality on the certificate manager.
-// This should be called early in the life of the server to make sure there are no
-// issues with TLS configs.
-// Returns the certificate manager if successfully created and in secure mode.
-func (cfg *Config) InitializeNodeTLSConfigs(
-	stopper *stop.Stopper,
-) (*security.CertificateManager, error) {
-	if cfg.Insecure {
-		return nil, nil
-	}
-
-	if _, err := cfg.GetServerTLSConfig(); err != nil {
-		return nil, err
-	}
-	if _, err := cfg.GetUIServerTLSConfig(); err != nil {
-		return nil, err
-	}
-	if _, err := cfg.GetClientTLSConfig(); err != nil {
-		return nil, err
-	}
-
-	cm, err := cfg.GetCertificateManager()
-	if err != nil {
-		return nil, err
-	}
-	cm.RegisterSignalHandler(stopper)
-	return cm, nil
-}
-
 // GetClientTLSConfig returns the client TLS config, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise ask the certificate
 // manager for a TLS config using certs for the config.User.
@@ -396,11 +407,11 @@ func (cfg *Config) GetClientTLSConfig() (*tls.Config, error) {
 	return tlsCfg, nil
 }
 
-// GetUIClientTLSConfig returns the client TLS config for Admin UI clients, initializing it if needed.
+// getUIClientTLSConfig returns the client TLS config for Admin UI clients, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise ask the certificate
 // manager for a TLS config configured to talk to the Admin UI.
 // This TLSConfig is **NOT** suitable to talk to the GRPC or SQL servers, use GetClientTLSConfig instead.
-func (cfg *Config) GetUIClientTLSConfig() (*tls.Config, error) {
+func (cfg *Config) getUIClientTLSConfig() (*tls.Config, error) {
 	// Early out.
 	if cfg.Insecure {
 		return nil, nil
@@ -442,9 +453,12 @@ func (cfg *Config) GetServerTLSConfig() (*tls.Config, error) {
 // GetUIServerTLSConfig returns the server TLS config for the Admin UI, initializing it if needed.
 // If Insecure is true, return a nil config, otherwise ask the certificate
 // manager for a server UI TLS config.
+//
+// TODO(peter): This method is only used by `server.NewServer` and
+// `Server.Start`. Move it.
 func (cfg *Config) GetUIServerTLSConfig() (*tls.Config, error) {
 	// Early out.
-	if cfg.Insecure {
+	if cfg.Insecure || cfg.DisableTLSForHTTP {
 		return nil, nil
 	}
 
@@ -467,7 +481,7 @@ func (cfg *Config) GetHTTPClient() (http.Client, error) {
 		cfg.httpClient.httpClient.Timeout = 10 * time.Second
 		var transport http.Transport
 		cfg.httpClient.httpClient.Transport = &transport
-		transport.TLSClientConfig, cfg.httpClient.err = cfg.GetUIClientTLSConfig()
+		transport.TLSClientConfig, cfg.httpClient.err = cfg.getUIClientTLSConfig()
 	})
 
 	return cfg.httpClient.httpClient, cfg.httpClient.err
@@ -510,19 +524,22 @@ type RaftConfig struct {
 	RaftMaxUncommittedEntriesSize uint64
 
 	// RaftMaxSizePerMsg controls the maximum aggregate byte size of Raft log
-	// entries the leader will send to followers in a single MsgApp.
+	// entries the leader will send to followers in a single MsgApp. Smaller
+	// value lowers the raft recovery cost (during initial probing and after
+	// message loss during normal operation). On the other hand, it limits the
+	// throughput during normal replication.
 	RaftMaxSizePerMsg uint64
 
 	// RaftMaxCommittedSizePerReady controls the maximum aggregate byte size of
 	// committed Raft log entries a replica will receive in a single Ready.
 	RaftMaxCommittedSizePerReady uint64
 
-	// RaftMaxInflightMsgs controls how many "inflight" messages Raft will send
+	// RaftMaxInflightMsgs controls how many "inflight" MsgApps Raft will send
 	// to a follower without hearing a response. The total number of Raft log
 	// entries is a combination of this setting and RaftMaxSizePerMsg. The
-	// current default settings provide for up to 1 MB of raft log to be sent
+	// current default settings provide for up to 4 MB of raft log to be sent
 	// without acknowledgement. With an average entry size of 1 KB that
-	// translates to ~1024 commands that might be executed in the handling of a
+	// translates to ~4096 commands that might be executed in the handling of a
 	// single raft.Ready operation.
 	RaftMaxInflightMsgs int
 
@@ -553,7 +570,7 @@ func (cfg *RaftConfig) SetDefaults() {
 	if cfg.RaftProposalQuota == 0 {
 		// By default, set this to a fraction of RaftLogMaxSize. See the comment
 		// on the field for the tradeoffs of setting this higher or lower.
-		cfg.RaftProposalQuota = cfg.RaftLogTruncationThreshold / 4
+		cfg.RaftProposalQuota = cfg.RaftLogTruncationThreshold / 2
 	}
 	if cfg.RaftMaxUncommittedEntriesSize == 0 {
 		// By default, set this to twice the RaftProposalQuota. The logic here
@@ -571,7 +588,6 @@ func (cfg *RaftConfig) SetDefaults() {
 	if cfg.RaftMaxInflightMsgs == 0 {
 		cfg.RaftMaxInflightMsgs = defaultRaftMaxInflightMsgs
 	}
-
 	if cfg.RaftDelaySplitToSuppressSnapshotTicks == 0 {
 		// The Raft Ticks interval defaults to 200ms, and an election is 15
 		// ticks. Add a generous amount of ticks to make sure even a backed up
@@ -583,6 +599,14 @@ func (cfg *RaftConfig) SetDefaults() {
 		//
 		// The resulting delay configured here is about 50s.
 		cfg.RaftDelaySplitToSuppressSnapshotTicks = 3*cfg.RaftElectionTimeoutTicks + 200
+	}
+
+	// Minor validation to ensure sane tuning.
+	if cfg.RaftProposalQuota > int64(cfg.RaftMaxUncommittedEntriesSize) {
+		panic("raft proposal quota should not be above max uncommitted entries size")
+	}
+	if cfg.RaftProposalQuota < int64(cfg.RaftMaxSizePerMsg)*int64(cfg.RaftMaxInflightMsgs) {
+		panic("raft proposal quota should not be below per-replica replication window size")
 	}
 }
 
@@ -695,13 +719,13 @@ type TempStorageConfig struct {
 	// use. If InMemory is set, than this has to be a memory monitor; otherwise it
 	// has to be a disk monitor.
 	Mon *mon.BytesMonitor
-	// StoreIdx stores the index of the StoreSpec this TempStorageConfig will use.
-	SpecIdx int
+	// Spec stores the StoreSpec this TempStorageConfig will use.
+	Spec StoreSpec
 }
 
-// ExternalIOConfig describes various configuration options pertaining
+// ExternalIODirConfig describes various configuration options pertaining
 // to external storage implementations.
-type ExternalIOConfig struct {
+type ExternalIODirConfig struct {
 	// Disables the use of external HTTP endpoints.
 	// This turns off http:// external storage as well as any custom
 	// endpoints cloud storage implementations.
@@ -719,41 +743,31 @@ type ExternalIOConfig struct {
 func TempStorageConfigFromEnv(
 	ctx context.Context,
 	st *cluster.Settings,
-	firstStore StoreSpec,
+	useStore StoreSpec,
 	parentDir string,
 	maxSizeBytes int64,
-	specIdx int,
 ) TempStorageConfig {
-	inMem := parentDir == "" && firstStore.InMemory
-	var monitor mon.BytesMonitor
+	inMem := parentDir == "" && useStore.InMemory
+	var monitorName string
 	if inMem {
-		monitor = mon.MakeMonitor(
-			"in-mem temp storage",
-			mon.MemoryResource,
-			nil,             /* curCount */
-			nil,             /* maxHist */
-			1024*1024,       /* increment */
-			maxSizeBytes/10, /* noteworthy */
-			st,
-		)
-		monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+		monitorName = "in-mem temp storage"
 	} else {
-		monitor = mon.MakeMonitor(
-			"temp disk storage",
-			mon.DiskResource,
-			nil,             /* curCount */
-			nil,             /* maxHist */
-			1024*1024,       /* increment */
-			maxSizeBytes/10, /* noteworthy */
-			st,
-		)
-		monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
+		monitorName = "temp disk storage"
 	}
-
+	monitor := mon.MakeMonitor(
+		monitorName,
+		mon.DiskResource,
+		nil,             /* curCount */
+		nil,             /* maxHist */
+		1024*1024,       /* increment */
+		maxSizeBytes/10, /* noteworthy */
+		st,
+	)
+	monitor.Start(ctx, nil /* pool */, mon.MakeStandaloneBudget(maxSizeBytes))
 	return TempStorageConfig{
 		InMemory: inMem,
 		Mon:      &monitor,
-		SpecIdx:  specIdx,
+		Spec:     useStore,
 	}
 }
 

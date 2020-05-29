@@ -6,11 +6,11 @@ CREATE TABLE a (id INT PRIMARY KEY)
 statement ok
 CREATE TABLE b (id INT PRIMARY KEY)
 
-query T
+query TTT
 SHOW TABLES FROM test
 ----
-a
-b
+public  a  table
+public  b  table
 
 statement ok
 INSERT INTO a VALUES (3),(7),(2)
@@ -25,20 +25,20 @@ SELECT * FROM a
 statement ok
 DROP TABLE a
 
-# TODO (lucy): Update this once we have GC jobs.
 # The "updating privileges" clause in the SELECT statement is for excluding jobs
 # run by an unrelated startup migration.
 # TODO (lucy): Update this if/when we decide to change how these jobs queued by
 # the startup migration are handled.
 query TT
-SELECT status, running_status FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE' AND description != 'updating privileges'
+SELECT job_type, status FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE GC' OR (job_type = 'SCHEMA CHANGE' AND description != 'updating privileges')
 ----
-succeeded  NULL
+SCHEMA CHANGE     succeeded
+SCHEMA CHANGE GC  running
 
-query T
+query TTT
 SHOW TABLES FROM test
 ----
-b
+public  b  table
 
 statement error pgcode 42P01 relation "a" does not exist
 SELECT * FROM a

@@ -17,13 +17,13 @@ import (
 	"reflect"
 	"unsafe"
 
+	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
-	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/errors"
 )
@@ -374,6 +374,9 @@ func (h *hasher) HashDatum(val tree.Datum) {
 		// disambiguate.
 		alwaysHashType := len(t.Array) == 0
 		h.hashDatumsWithType(t.Array, t.ResolvedType(), alwaysHashType)
+	case *tree.DCollatedString:
+		h.HashString(t.Locale)
+		h.HashString(t.Contents)
 	default:
 		h.bytes = encodeDatum(h.bytes[:0], val)
 		h.HashBytes(h.bytes)
@@ -410,15 +413,6 @@ func (h *hasher) HashStatement(val tree.Statement) {
 
 func (h *hasher) HashColumnID(val opt.ColumnID) {
 	h.HashUint64(uint64(val))
-}
-
-func (h *hasher) HashFastIntSet(val util.FastIntSet) {
-	hash := h.hash
-	for c, ok := val.Next(0); ok; c, ok = val.Next(c + 1) {
-		hash ^= internHash(c)
-		hash *= prime64
-	}
-	h.hash = hash
 }
 
 func (h *hasher) HashColSet(val opt.ColSet) {
@@ -493,9 +487,22 @@ func (h *hasher) HashJoinFlags(val JoinFlags) {
 	h.HashUint64(uint64(val))
 }
 
+func (h *hasher) HashFKCascades(val FKCascades) {
+	for i := range val {
+		h.HashUint64(uint64(reflect.ValueOf(val[i].Builder).Pointer()))
+	}
+}
+
 func (h *hasher) HashExplainOptions(val tree.ExplainOptions) {
-	h.HashFastIntSet(val.Flags)
 	h.HashUint64(uint64(val.Mode))
+	hash := h.hash
+	for i, val := range val.Flags {
+		if val {
+			hash ^= internHash(uint64(i))
+			hash *= prime64
+		}
+	}
+	h.hash = hash
 }
 
 func (h *hasher) HashStatementType(val tree.StatementType) {
@@ -552,6 +559,10 @@ func (h *hasher) HashLockingItem(val *tree.LockingItem) {
 		h.HashByte(byte(val.Strength))
 		h.HashByte(byte(val.WaitPolicy))
 	}
+}
+
+func (h *hasher) HashGeoRelationshipType(val geoindex.RelationshipType) {
+	h.HashUint64(uint64(val))
 }
 
 func (h *hasher) HashRelExpr(val RelExpr) {
@@ -636,6 +647,11 @@ func (h *hasher) HashPointer(val unsafe.Pointer) {
 	h.HashUint64(uint64(uintptr(val)))
 }
 
+func (h *hasher) HashMaterializeClause(val tree.MaterializeClause) {
+	h.HashBool(val.Set)
+	h.HashBool(val.Materialize)
+}
+
 // ----------------------------------------------------------------------
 //
 // Equality functions
@@ -689,68 +705,62 @@ func (h *hasher) IsTypeEqual(l, r *types.T) bool {
 }
 
 func (h *hasher) IsDatumEqual(l, r tree.Datum) bool {
+	if reflect.TypeOf(l) != reflect.TypeOf(r) {
+		return false
+	}
 	switch lt := l.(type) {
 	case *tree.DBool:
-		if rt, ok := r.(*tree.DBool); ok {
-			return *lt == *rt
-		}
+		rt := r.(*tree.DBool)
+		return *lt == *rt
 	case *tree.DInt:
-		if rt, ok := r.(*tree.DInt); ok {
-			return *lt == *rt
-		}
+		rt := r.(*tree.DInt)
+		return *lt == *rt
 	case *tree.DFloat:
-		if rt, ok := r.(*tree.DFloat); ok {
-			return h.IsFloat64Equal(float64(*lt), float64(*rt))
-		}
+		rt := r.(*tree.DFloat)
+		return h.IsFloat64Equal(float64(*lt), float64(*rt))
 	case *tree.DString:
-		if rt, ok := r.(*tree.DString); ok {
-			return h.IsStringEqual(string(*lt), string(*rt))
-		}
+		rt := r.(*tree.DString)
+		return h.IsStringEqual(string(*lt), string(*rt))
+	case *tree.DCollatedString:
+		rt := r.(*tree.DCollatedString)
+		return lt.Locale == rt.Locale && h.IsStringEqual(lt.Contents, rt.Contents)
 	case *tree.DBytes:
-		if rt, ok := r.(*tree.DBytes); ok {
-			return bytes.Equal([]byte(*lt), []byte(*rt))
-		}
+		rt := r.(*tree.DBytes)
+		return bytes.Equal([]byte(*lt), []byte(*rt))
 	case *tree.DDate:
-		if rt, ok := r.(*tree.DDate); ok {
-			return lt.Date == rt.Date
-		}
+		rt := r.(*tree.DDate)
+		return lt.Date == rt.Date
 	case *tree.DTime:
-		if rt, ok := r.(*tree.DTime); ok {
-			return uint64(*lt) == uint64(*rt)
-		}
+		rt := r.(*tree.DTime)
+		return uint64(*lt) == uint64(*rt)
 	case *tree.DJSON:
-		if rt, ok := r.(*tree.DJSON); ok {
-			return h.IsStringEqual(lt.String(), rt.String())
-		}
+		rt := r.(*tree.DJSON)
+		return h.IsStringEqual(lt.String(), rt.String())
 	case *tree.DTuple:
-		if rt, ok := r.(*tree.DTuple); ok {
-			// Compare datums and then compare static types if nulls or labels
-			// are present.
-			ltyp := lt.ResolvedType()
-			rtyp := rt.ResolvedType()
-			if !h.areDatumsWithTypeEqual(lt.D, rt.D, ltyp, rtyp) {
-				return false
-			}
-			return len(ltyp.TupleLabels()) == 0 || h.IsTypeEqual(ltyp, rtyp)
+		rt := r.(*tree.DTuple)
+		// Compare datums and then compare static types if nulls or labels
+		// are present.
+		ltyp := lt.ResolvedType()
+		rtyp := rt.ResolvedType()
+		if !h.areDatumsWithTypeEqual(lt.D, rt.D, ltyp, rtyp) {
+			return false
 		}
+		return len(ltyp.TupleLabels()) == 0 || h.IsTypeEqual(ltyp, rtyp)
 	case *tree.DArray:
-		if rt, ok := r.(*tree.DArray); ok {
-			// Compare datums and then compare static types if nulls are present
-			// or if arrays are empty.
-			ltyp := lt.ResolvedType()
-			rtyp := rt.ResolvedType()
-			if !h.areDatumsWithTypeEqual(lt.Array, rt.Array, ltyp, rtyp) {
-				return false
-			}
-			return len(lt.Array) != 0 || h.IsTypeEqual(ltyp, rtyp)
+		rt := r.(*tree.DArray)
+		// Compare datums and then compare static types if nulls are present
+		// or if arrays are empty.
+		ltyp := lt.ResolvedType()
+		rtyp := rt.ResolvedType()
+		if !h.areDatumsWithTypeEqual(lt.Array, rt.Array, ltyp, rtyp) {
+			return false
 		}
+		return len(lt.Array) != 0 || h.IsTypeEqual(ltyp, rtyp)
 	default:
 		h.bytes = encodeDatum(h.bytes[:0], l)
 		h.bytes2 = encodeDatum(h.bytes2[:0], r)
 		return bytes.Equal(h.bytes, h.bytes2)
 	}
-
-	return false
 }
 
 func (h *hasher) areDatumsWithTypeEqual(ldatums, rdatums tree.Datums, ltyp, rtyp *types.T) bool {
@@ -834,8 +844,21 @@ func (h *hasher) IsJoinFlagsEqual(l, r JoinFlags) bool {
 	return l == r
 }
 
+func (h *hasher) IsFKCascadesEqual(l, r FKCascades) bool {
+	if len(l) != len(r) {
+		return false
+	}
+	for i := range l {
+		// It's sufficient to compare the CascadeBuilder instances.
+		if l[i].Builder != r[i].Builder {
+			return false
+		}
+	}
+	return true
+}
+
 func (h *hasher) IsExplainOptionsEqual(l, r tree.ExplainOptions) bool {
-	return l.Mode == r.Mode && l.Flags.Equals(r.Flags)
+	return l == r
 }
 
 func (h *hasher) IsStatementTypeEqual(l, r tree.StatementType) bool {
@@ -881,6 +904,10 @@ func (h *hasher) IsLockingItemEqual(l, r *tree.LockingItem) bool {
 		return l == r
 	}
 	return l.Strength == r.Strength && l.WaitPolicy == r.WaitPolicy
+}
+
+func (h *hasher) IsGeoRelationshipTypeEqual(l, r geoindex.RelationshipType) bool {
+	return l == r
 }
 
 func (h *hasher) IsPointerEqual(l, r unsafe.Pointer) bool {
@@ -1009,26 +1036,32 @@ func (h *hasher) IsOpaqueMetadataEqual(l, r opt.OpaqueMetadata) bool {
 	return l == r
 }
 
+func (h *hasher) IsMaterializeClauseEqual(l, r tree.MaterializeClause) bool {
+	return l.Set == r.Set && l.Materialize == r.Materialize
+}
+
 // encodeDatum turns the given datum into an encoded string of bytes. If two
 // datums are equivalent, then their encoded bytes will be identical.
 // Conversely, if two datums are not equivalent, then their encoded bytes will
-// differ.
+// differ. This will panic if the datum cannot be encoded.
+// Notice: DCollatedString does not encode its collation and won't work here.
 func encodeDatum(b []byte, val tree.Datum) []byte {
+	var err error
+
 	// Fast path: encode the datum using table key encoding. This does not always
 	// work, because the encoding does not uniquely represent some values which
 	// should not be considered equivalent by the interner (e.g. decimal values
 	// 1.0 and 1.00).
-	if !sqlbase.DatumTypeHasCompositeKeyEncoding(val.ResolvedType()) {
-		var err error
+	if !sqlbase.HasCompositeKeyEncoding(val.ResolvedType()) {
 		b, err = sqlbase.EncodeTableKey(b, val, encoding.Ascending)
 		if err == nil {
 			return b
 		}
 	}
 
-	// Fall back on a string representation which can be used to check for
-	// equivalence.
-	ctx := tree.NewFmtCtx(tree.FmtCheckEquivalence)
-	val.Format(ctx)
-	return ctx.Bytes()
+	b, err = sqlbase.EncodeTableValue(b, sqlbase.ColumnID(encoding.NoColumnID), val, nil /* scratch */)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }

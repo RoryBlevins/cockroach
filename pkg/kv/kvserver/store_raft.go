@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	crdberrors "github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft/raftpb"
 )
@@ -218,11 +219,23 @@ func (s *Store) processRaftRequestWithReplica(
 		if req.Message.Type != raftpb.MsgHeartbeat {
 			log.Fatalf(ctx, "unexpected quiesce: %+v", req)
 		}
-		status := r.RaftStatus()
-		if status != nil && status.Term == req.Message.Term && status.Commit == req.Message.Commit {
-			if r.quiesce() {
-				return nil
-			}
+		// If another replica tells us to quiesce, we verify that according to
+		// it, we are fully caught up, and that we believe it to be the leader.
+		// If we didn't do this, this replica could only unquiesce by means of
+		// an election, which means that the request prompting the unquiesce
+		// would end up with latency on the order of an election timeout.
+		//
+		// There are additional checks in quiesceLocked() that prevent us from
+		// quiescing if there's outstanding work.
+		r.mu.Lock()
+		status := r.raftBasicStatusRLocked()
+		ok := status.Term == req.Message.Term &&
+			status.Commit == req.Message.Commit &&
+			status.Lead == req.Message.From &&
+			r.quiesceLocked()
+		r.mu.Unlock()
+		if ok {
+			return nil
 		}
 		if log.V(4) {
 			log.Infof(ctx, "not quiescing: local raft status is %+v, incoming quiesce message is %+v", status, req.Message)
@@ -344,8 +357,8 @@ func (s *Store) HandleRaftResponse(ctx context.Context, resp *RaftMessageRespons
 			case *roachpb.ReplicaTooOldError:
 				if replErr != nil {
 					// RangeNotFoundErrors are expected here; nothing else is.
-					if _, ok := replErr.(*roachpb.RangeNotFoundError); !ok {
-						log.Error(ctx, replErr)
+					if !errors.HasType(replErr, (*roachpb.RangeNotFoundError)(nil)) {
+						log.Errorf(ctx, "%v", replErr)
 					}
 					return nil
 				}
@@ -385,8 +398,8 @@ func (s *Store) HandleRaftResponse(ctx context.Context, resp *RaftMessageRespons
 			case *roachpb.RaftGroupDeletedError:
 				if replErr != nil {
 					// RangeNotFoundErrors are expected here; nothing else is.
-					if _, ok := replErr.(*roachpb.RangeNotFoundError); !ok {
-						log.Error(ctx, replErr)
+					if !errors.HasType(replErr, (*roachpb.RangeNotFoundError)(nil)) {
+						log.Errorf(ctx, "%v", replErr)
 					}
 					return nil
 				}
@@ -524,7 +537,7 @@ func (s *Store) processTick(ctx context.Context, rangeID roachpb.RangeID) bool {
 	r := (*Replica)(value)
 	exists, err := r.tick(livenessMap)
 	if err != nil {
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 	}
 	s.metrics.RaftTickingDurationNanos.Inc(timeutil.Since(start).Nanoseconds())
 	return exists // ready
@@ -539,8 +552,7 @@ func (s *Store) processTick(ctx context.Context, rangeID roachpb.RangeID) bool {
 // be rare, however, and we expect the newly live node to eventually
 // unquiesce the range.
 func (s *Store) nodeIsLiveCallback(nodeID roachpb.NodeID) {
-	// Update the liveness map.
-	s.livenessMap.Store(s.cfg.NodeLiveness.GetIsLiveMap())
+	s.updateLivenessMap()
 
 	s.mu.replicas.Range(func(k int64, v unsafe.Pointer) bool {
 		r := (*Replica)(v)
@@ -581,27 +593,7 @@ func (s *Store) raftTickLoop(ctx context.Context) {
 			rangeIDs = rangeIDs[:0]
 			// Update the liveness map.
 			if s.cfg.NodeLiveness != nil {
-				nextMap := s.cfg.NodeLiveness.GetIsLiveMap()
-				for nodeID, entry := range nextMap {
-					if entry.IsLive {
-						// Make sure we ask all live nodes for closed timestamp updates.
-						s.cfg.ClosedTimestamp.Clients.EnsureClient(nodeID)
-						continue
-					}
-					// Liveness claims that this node is down, but ConnHealth gets the last say
-					// because we'd rather quiesce a range too little than one too often.
-					//
-					// NB: This has false negatives. If a node doesn't have a conn open to it
-					// when ConnHealth is called, then ConnHealth will return
-					// rpc.ErrNotHeartbeated regardless of whether the node is up or not. That
-					// said, for the nodes that matter, we're likely talking to them via the
-					// Raft transport, so ConnHealth should usually indicate a real problem if
-					// it gives us an error back. The check can also have false positives if the
-					// node goes down after populating the map, but that matters even less.
-					entry.IsLive = (s.cfg.NodeDialer.ConnHealth(nodeID, rpc.SystemClass) == nil)
-					nextMap[nodeID] = entry
-				}
-				s.livenessMap.Store(nextMap)
+				s.updateLivenessMap()
 			}
 
 			s.unquiescedReplicas.Lock()
@@ -622,6 +614,32 @@ func (s *Store) raftTickLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (s *Store) updateLivenessMap() {
+	nextMap := s.cfg.NodeLiveness.GetIsLiveMap()
+	for nodeID, entry := range nextMap {
+		if entry.IsLive {
+			// Make sure we ask all live nodes for closed timestamp updates.
+			s.cfg.ClosedTimestamp.Clients.EnsureClient(nodeID)
+			continue
+		}
+		// Liveness claims that this node is down, but ConnHealth gets the last say
+		// because we'd rather quiesce a range too little than one too often. Note
+		// that this policy is different from the one governing the releasing of
+		// proposal quota; see comments over there.
+		//
+		// NB: This has false negatives. If a node doesn't have a conn open to it
+		// when ConnHealth is called, then ConnHealth will return
+		// rpc.ErrNotHeartbeated regardless of whether the node is up or not. That
+		// said, for the nodes that matter, we're likely talking to them via the
+		// Raft transport, so ConnHealth should usually indicate a real problem if
+		// it gives us an error back. The check can also have false positives if the
+		// node goes down after populating the map, but that matters even less.
+		entry.IsLive = (s.cfg.NodeDialer.ConnHealth(nodeID, rpc.SystemClass) == nil)
+		nextMap[nodeID] = entry
+	}
+	s.livenessMap.Store(nextMap)
 }
 
 // Since coalesced heartbeats adds latency to heartbeat messages, it is
@@ -682,7 +700,6 @@ func (s *Store) sendQueuedHeartbeatsToNode(
 	}
 
 	if !s.cfg.Transport.SendAsync(chReq, rpc.SystemClass) {
-		chReq.release()
 		for _, beat := range beats {
 			if value, ok := s.mu.replicas.Load(int64(beat.RangeID)); ok {
 				(*Replica)(value).addUnreachableRemoteReplica(beat.ToReplicaID)

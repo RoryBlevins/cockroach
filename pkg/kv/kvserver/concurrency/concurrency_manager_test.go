@@ -51,18 +51,18 @@ import (
 //
 // The input files use the following DSL:
 //
-// new-txn      name=<txn-name> ts=<int>[,<int>] epoch=<int>
+// new-txn      name=<txn-name> ts=<int>[,<int>] epoch=<int> [maxts=<int>[,<int>]]
 // new-request  name=<req-name> txn=<txn-name>|none ts=<int>[,<int>] [priority] [consistency]
-//   <proto-name> [<field-name>=<field-value>...]
+//   <proto-name> [<field-name>=<field-value>...] (hint: see scanSingleRequest)
 // sequence     req=<req-name>
 // finish       req=<req-name>
 //
 // handle-write-intent-error  req=<req-name> txn=<txn-name> key=<key>
 // handle-txn-push-error      req=<req-name> txn=<txn-name> key=<key>  TODO(nvanbenschoten): implement this
 //
-// on-lock-acquired  txn=<txn-name> key=<key>
-// on-lock-updated   txn=<txn-name> key=<key> status=[committed|aborted|pending] [ts<int>[,<int>]]
-// on-txn-updated    txn=<txn-name> status=[committed|aborted|pending] [ts<int>[,<int>]]
+// on-lock-acquired  req=<req-name> key=<key> [seq=<seq>] [dur=r|u]
+// on-lock-updated   req=<req-name> txn=<txn-name> key=<key> status=[committed|aborted|pending] [ts=<int>[,<int>]]
+// on-txn-updated    txn=<txn-name> status=[committed|aborted|pending] [ts=<int>[,<int>]]
 //
 // on-lease-updated  leaseholder=<bool>
 // on-split
@@ -94,6 +94,11 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				var epoch int
 				d.ScanArgs(t, "epoch", &epoch)
 
+				maxTS := ts
+				if d.HasArg("maxts") {
+					maxTS = scanTimestampWithName(t, d, "maxts")
+				}
+
 				txn, ok := c.txnsByName[txnName]
 				var id uuid.UUID
 				if ok {
@@ -110,6 +115,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 						Priority:       1, // not min or max
 					},
 					ReadTimestamp: ts,
+					MaxTimestamp:  maxTS,
 				}
 				txn.UpdateObservedTimestamp(c.nodeDesc.NodeID, ts)
 				c.registerTxn(txnName, txn)
@@ -130,8 +136,10 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				}
 
 				ts := scanTimestamp(t, d)
-				if txn != nil && txn.ReadTimestamp != ts {
-					d.Fatalf(t, "txn read timestamp != timestamp")
+				if txn != nil {
+					txn = txn.Clone()
+					txn.ReadTimestamp = ts
+					txn.WriteTimestamp = ts
 				}
 
 				readConsistency := roachpb.CONSISTENT
@@ -143,7 +151,7 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 				var reqs []roachpb.Request
 				singleReqLines := strings.Split(d.Input, "\n")
 				for _, line := range singleReqLines {
-					req := scanSingleRequest(t, d, line)
+					req := scanSingleRequest(t, d, line, c.txnsByName)
 					reqs = append(reqs, req)
 				}
 				reqUnions := make([]roachpb.RequestUnion, len(reqs))
@@ -215,51 +223,112 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 			case "handle-write-intent-error":
 				var reqName string
 				d.ScanArgs(t, "req", &reqName)
+				prev, ok := c.guardsByReqName[reqName]
+				if !ok {
+					d.Fatalf(t, "unknown request: %s", reqName)
+				}
+
+				// Each roachpb.Intent is provided on an indented line.
+				var intents []roachpb.Intent
+				singleReqLines := strings.Split(d.Input, "\n")
+				for _, line := range singleReqLines {
+					var err error
+					d.Cmd, d.CmdArgs, err = datadriven.ParseLine(line)
+					if err != nil {
+						d.Fatalf(t, "error parsing single intent: %v", err)
+					}
+					if d.Cmd != "intent" {
+						d.Fatalf(t, "expected \"intent\", found %s", d.Cmd)
+					}
+
+					var txnName string
+					d.ScanArgs(t, "txn", &txnName)
+					txn, ok := c.txnsByName[txnName]
+					if !ok {
+						d.Fatalf(t, "unknown txn %s", txnName)
+					}
+
+					var key string
+					d.ScanArgs(t, "key", &key)
+
+					intents = append(intents, roachpb.MakeIntent(&txn.TxnMeta, roachpb.Key(key)))
+				}
+
+				opName := fmt.Sprintf("handle write intent error %s", reqName)
+				mon.runAsync(opName, func(ctx context.Context) {
+					wiErr := &roachpb.WriteIntentError{Intents: intents}
+					guard, err := m.HandleWriterIntentError(ctx, prev, wiErr)
+					if err != nil {
+						log.Eventf(ctx, "handled %v, returned error: %v", wiErr, err)
+						c.mu.Lock()
+						delete(c.guardsByReqName, reqName)
+						c.mu.Unlock()
+					} else {
+						log.Eventf(ctx, "handled %v, released latches", wiErr)
+						c.mu.Lock()
+						c.guardsByReqName[reqName] = guard
+						c.mu.Unlock()
+					}
+				})
+				return c.waitAndCollect(t, mon)
+
+			case "on-lock-acquired":
+				var reqName string
+				d.ScanArgs(t, "req", &reqName)
+				guard, ok := c.guardsByReqName[reqName]
+				if !ok {
+					d.Fatalf(t, "unknown request: %s", reqName)
+				}
+				txn := guard.Req.Txn
+
+				var key string
+				d.ScanArgs(t, "key", &key)
+
+				var seq int
+				if d.HasArg("seq") {
+					d.ScanArgs(t, "seq", &seq)
+				}
+				seqNum := enginepb.TxnSeq(seq)
+
+				dur := lock.Unreplicated
+				if d.HasArg("dur") {
+					dur = scanLockDurability(t, d)
+				}
+
+				// Confirm that the request has a corresponding write request.
+				found := false
+				for _, ru := range guard.Req.Requests {
+					req := ru.GetInner()
+					keySpan := roachpb.Span{Key: roachpb.Key(key)}
+					if roachpb.IsLocking(req) &&
+						req.Header().Span().Contains(keySpan) &&
+						req.Header().Sequence == seqNum {
+						found = true
+						break
+					}
+				}
+				if !found {
+					d.Fatalf(t, "missing corresponding write request")
+				}
+
+				txnAcquire := txn.Clone()
+				txnAcquire.Sequence = seqNum
+
+				mon.runSync("acquire lock", func(ctx context.Context) {
+					log.Eventf(ctx, "txn %s @ %s", txn.ID.Short(), key)
+					acq := roachpb.MakeLockAcquisition(txnAcquire, roachpb.Key(key), dur)
+					m.OnLockAcquired(ctx, &acq)
+				})
+				return c.waitAndCollect(t, mon)
+
+			case "on-lock-updated":
+				var reqName string
+				d.ScanArgs(t, "req", &reqName)
 				guard, ok := c.guardsByReqName[reqName]
 				if !ok {
 					d.Fatalf(t, "unknown request: %s", reqName)
 				}
 
-				var txnName string
-				d.ScanArgs(t, "txn", &txnName)
-				txn, ok := c.txnsByName[txnName]
-				if !ok {
-					d.Fatalf(t, "unknown txn %s", txnName)
-				}
-
-				var key string
-				d.ScanArgs(t, "key", &key)
-
-				opName := fmt.Sprintf("handle write intent error %s", reqName)
-				mon.runSync(opName, func(ctx context.Context) {
-					err := &roachpb.WriteIntentError{Intents: []roachpb.Intent{
-						roachpb.MakeIntent(&txn.TxnMeta, roachpb.Key(key)),
-					}}
-					log.Eventf(ctx, "handling %v", err)
-					guard = m.HandleWriterIntentError(ctx, guard, err)
-				})
-				return c.waitAndCollect(t, mon)
-
-			case "on-lock-acquired":
-				var txnName string
-				d.ScanArgs(t, "txn", &txnName)
-				txn, ok := c.txnsByName[txnName]
-				if !ok {
-					d.Fatalf(t, "unknown txn %s", txnName)
-				}
-
-				var key string
-				d.ScanArgs(t, "key", &key)
-
-				mon.runSync("acquire lock", func(ctx context.Context) {
-					log.Eventf(ctx, "%s @ %s", txnName, key)
-					span := roachpb.Span{Key: roachpb.Key(key)}
-					up := roachpb.MakeLockUpdateWithDur(txn, span, lock.Unreplicated)
-					m.OnLockAcquired(ctx, &up)
-				})
-				return c.waitAndCollect(t, mon)
-
-			case "on-lock-updated":
 				var txnName string
 				d.ScanArgs(t, "txn", &txnName)
 				txn, ok := c.txnsByName[txnName]
@@ -276,12 +345,27 @@ func TestConcurrencyManagerBasic(t *testing.T) {
 					ts = scanTimestamp(t, d)
 				}
 
+				// Confirm that the request has a corresponding ResolveIntent.
+				found := false
+				for _, ru := range guard.Req.Requests {
+					if riReq := ru.GetResolveIntent(); riReq != nil &&
+						riReq.IntentTxn.ID == txn.ID &&
+						riReq.Key.Equal(roachpb.Key(key)) &&
+						riReq.Status == status {
+						found = true
+						break
+					}
+				}
+				if !found {
+					d.Fatalf(t, "missing corresponding resolve intent request")
+				}
+
 				txnUpdate := txn.Clone()
 				txnUpdate.Status = status
 				txnUpdate.WriteTimestamp.Forward(ts)
 
 				mon.runSync("update lock", func(ctx context.Context) {
-					log.Eventf(ctx, "%s %s @ %s", verb, txnName, key)
+					log.Eventf(ctx, "%s txn %s @ %s", verb, txn.ID.Short(), key)
 					span := roachpb.Span{Key: roachpb.Key(key)}
 					up := roachpb.MakeLockUpdate(txnUpdate, span)
 					m.OnLockUpdated(ctx, &up)
@@ -444,23 +528,22 @@ func (c *cluster) makeConfig() concurrency.Config {
 // PushTransaction implements the concurrency.IntentResolver interface.
 func (c *cluster) PushTransaction(
 	ctx context.Context, pushee *enginepb.TxnMeta, h roachpb.Header, pushType roachpb.PushTxnType,
-) (roachpb.Transaction, *roachpb.Error) {
-	log.Eventf(ctx, "pushing txn %s", pushee.ID.Short())
+) (*roachpb.Transaction, *roachpb.Error) {
 	pusheeRecord, err := c.getTxnRecord(pushee.ID)
 	if err != nil {
-		return roachpb.Transaction{}, roachpb.NewError(err)
+		return nil, roachpb.NewError(err)
 	}
 	var pusherRecord *txnRecord
 	if h.Txn != nil {
 		pusherID := h.Txn.ID
 		pusherRecord, err = c.getTxnRecord(pusherID)
 		if err != nil {
-			return roachpb.Transaction{}, roachpb.NewError(err)
+			return nil, roachpb.NewError(err)
 		}
 
 		push, err := c.registerPush(ctx, pusherID, pushee.ID)
 		if err != nil {
-			return roachpb.Transaction{}, roachpb.NewError(err)
+			return nil, roachpb.NewError(err)
 		}
 		defer c.unregisterPush(push)
 	}
@@ -474,7 +557,7 @@ func (c *cluster) PushTransaction(
 		case roachpb.PUSH_ABORT:
 			pushed = pusheeTxn.Status.IsFinalized()
 		default:
-			return roachpb.Transaction{}, roachpb.NewErrorf("unexpected push type: %s", pushType)
+			return nil, roachpb.NewErrorf("unexpected push type: %s", pushType)
 		}
 		if pushed {
 			return pusheeTxn, nil
@@ -482,12 +565,12 @@ func (c *cluster) PushTransaction(
 		// Or the pusher aborted?
 		var pusherRecordSig chan struct{}
 		if pusherRecord != nil {
-			var pusherTxn roachpb.Transaction
+			var pusherTxn *roachpb.Transaction
 			pusherTxn, pusherRecordSig = pusherRecord.asTxn()
 			if pusherTxn.Status == roachpb.ABORTED {
 				log.Eventf(ctx, "detected pusher aborted")
 				err := roachpb.NewTransactionAbortedError(roachpb.ABORT_REASON_PUSHER_ABORTED)
-				return roachpb.Transaction{}, roachpb.NewError(err)
+				return nil, roachpb.NewError(err)
 			}
 		}
 		// Wait until either record is updated.
@@ -495,7 +578,7 @@ func (c *cluster) PushTransaction(
 		case <-pusheeRecordSig:
 		case <-pusherRecordSig:
 		case <-ctx.Done():
-			return roachpb.Transaction{}, roachpb.NewError(ctx.Err())
+			return nil, roachpb.NewError(ctx.Err())
 		}
 	}
 }
@@ -506,6 +589,19 @@ func (c *cluster) ResolveIntent(
 ) *roachpb.Error {
 	log.Eventf(ctx, "resolving intent %s for txn %s with %s status", intent.Key, intent.Txn.ID.Short(), intent.Status)
 	c.m.OnLockUpdated(ctx, &intent)
+	return nil
+}
+
+// ResolveIntents implements the concurrency.IntentResolver interface.
+func (c *cluster) ResolveIntents(
+	ctx context.Context, intents []roachpb.LockUpdate, opts intentresolver.ResolveOptions,
+) *roachpb.Error {
+	log.Eventf(ctx, "resolving a batch of %d intent(s)", len(intents))
+	for _, intent := range intents {
+		if err := c.ResolveIntent(ctx, intent, opts); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -552,10 +648,10 @@ func (c *cluster) updateTxnRecord(
 	return nil
 }
 
-func (r *txnRecord) asTxn() (roachpb.Transaction, chan struct{}) {
+func (r *txnRecord) asTxn() (*roachpb.Transaction, chan struct{}) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	txn := *r.txn
+	txn := r.txn.Clone()
 	if r.updatedStatus > txn.Status {
 		txn.Status = r.updatedStatus
 	}

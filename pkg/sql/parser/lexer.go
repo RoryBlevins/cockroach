@@ -80,7 +80,7 @@ func (l *lexer) Lex(lval *sqlSymType) int {
 	*lval = l.tokens[l.lastPos]
 
 	switch lval.id {
-	case NOT, WITH, AS:
+	case NOT, WITH, AS, GENERATED:
 		nextID := int32(0)
 		if l.lastPos+1 < len(l.tokens) {
 			nextID = l.tokens[l.lastPos+1].id
@@ -97,6 +97,11 @@ func (l *lexer) Lex(lval *sqlSymType) int {
 			switch nextID {
 			case BETWEEN, IN, LIKE, ILIKE, SIMILAR:
 				lval.id = NOT_LA
+			}
+		case GENERATED:
+			switch nextID {
+			case ALWAYS:
+				lval.id = GENERATED_ALWAYS
 			}
 
 		case WITH:
@@ -158,6 +163,20 @@ func (l *lexer) UnimplementedWithIssue(issue int) {
 // UnimplementedWithIssueDetail wraps Error, setting lastUnimplementedError.
 func (l *lexer) UnimplementedWithIssueDetail(issue int, detail string) {
 	l.lastError = unimp.NewWithIssueDetail(issue, detail, "this syntax")
+	l.populateErrorDetails()
+}
+
+// PurposelyUnimplemented wraps Error, setting lastUnimplementedError.
+func (l *lexer) PurposelyUnimplemented(feature string, reason string) {
+	// We purposely do not use unimp here, as it appends hints to suggest that
+	// the error may be actively tracked as a bug.
+	l.lastError = errors.WithHint(
+		errors.WithTelemetry(
+			pgerror.Newf(pgcode.Syntax, "unimplemented: this syntax"),
+			fmt.Sprintf("sql.purposely_unimplemented.%s", feature),
+		),
+		reason,
+	)
 	l.populateErrorDetails()
 }
 

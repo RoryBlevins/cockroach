@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/errors"
 	"github.com/opentracing/opentracing-go"
-	"github.com/pkg/errors"
 )
 
 // tableReader is the start of a computation flow; it performs KV operations to
@@ -60,6 +60,7 @@ var _ execinfra.Processor = &tableReader{}
 var _ execinfra.RowSource = &tableReader{}
 var _ execinfrapb.MetadataSource = &tableReader{}
 var _ execinfra.Releasable = &tableReader{}
+var _ execinfra.OpNode = &tableReader{}
 
 const tableReaderProcName = "table reader"
 
@@ -77,7 +78,8 @@ func newTableReader(
 	post *execinfrapb.PostProcessSpec,
 	output execinfra.RowReceiver,
 ) (*tableReader, error) {
-	if flowCtx.NodeID == 0 {
+	// NB: we hit this with a zero NodeID (but !ok) with multi-tenancy.
+	if nodeID, ok := flowCtx.NodeID.OptionalNodeID(); ok && nodeID == 0 {
 		return nil, errors.Errorf("attempting to create a tableReader with uninitialized NodeID")
 	}
 
@@ -115,7 +117,7 @@ func newTableReader(
 	var fetcher row.Fetcher
 	columnIdxMap := spec.Table.ColumnIdxMapWithMutations(returnMutations)
 	if _, _, err := initRowFetcher(
-		&fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap, spec.Reverse,
+		flowCtx, &fetcher, &spec.Table, int(spec.IndexIdx), columnIdxMap, spec.Reverse,
 		neededColumns, spec.IsCheck, &tr.alloc, spec.Visibility, spec.LockingStrength,
 	); err != nil {
 		return nil, err
@@ -274,9 +276,12 @@ func (tr *tableReader) outputStatsToTrace() {
 func (tr *tableReader) generateMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
 	var trailingMeta []execinfrapb.ProducerMetadata
 	if !tr.ignoreMisplannedRanges {
-		ranges := execinfra.MisplannedRanges(ctx, tr.fetcher.GetRangesInfo(), tr.FlowCtx.NodeID)
-		if ranges != nil {
-			trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
+		nodeID, ok := tr.FlowCtx.NodeID.OptionalNodeID()
+		if ok {
+			ranges := execinfra.MisplannedRanges(ctx, tr.fetcher.GetRangesInfo(), nodeID)
+			if ranges != nil {
+				trailingMeta = append(trailingMeta, execinfrapb.ProducerMetadata{Ranges: ranges})
+			}
 		}
 	}
 	if tfs := execinfra.GetLeafTxnFinalState(ctx, tr.FlowCtx.Txn); tfs != nil {
@@ -293,4 +298,14 @@ func (tr *tableReader) generateMeta(ctx context.Context) []execinfrapb.ProducerM
 // DrainMeta is part of the MetadataSource interface.
 func (tr *tableReader) DrainMeta(ctx context.Context) []execinfrapb.ProducerMetadata {
 	return tr.generateMeta(ctx)
+}
+
+// ChildCount is part of the execinfra.OpNode interface.
+func (tr *tableReader) ChildCount(bool) int {
+	return 0
+}
+
+// Child is part of the execinfra.OpNode interface.
+func (tr *tableReader) Child(nth int, _ bool) execinfra.OpNode {
+	panic(fmt.Sprintf("invalid index %d", nth))
 }

@@ -19,7 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // A runnable can be run as an async task.
@@ -57,7 +57,7 @@ func (s *initResolvedTSScan) Run(ctx context.Context) {
 	defer s.Cancel()
 	if err := s.iterateAndConsume(ctx); err != nil {
 		err = errors.Wrap(err, "initial resolved timestamp scan failed")
-		log.Error(ctx, err)
+		log.Errorf(ctx, "%v", err)
 		s.p.StopWithErr(roachpb.NewError(err))
 	} else {
 		// Inform the processor that its resolved timestamp can be initialized.
@@ -116,10 +116,10 @@ func (s *initResolvedTSScan) Cancel() {
 type TxnPusher interface {
 	// PushTxns attempts to push the specified transactions to a new
 	// timestamp. It returns the resulting transaction protos.
-	PushTxns(context.Context, []enginepb.TxnMeta, hlc.Timestamp) ([]roachpb.Transaction, error)
+	PushTxns(context.Context, []enginepb.TxnMeta, hlc.Timestamp) ([]*roachpb.Transaction, error)
 	// CleanupTxnIntentsAsync asynchronously cleans up intents owned
 	// by the specified transactions.
-	CleanupTxnIntentsAsync(context.Context, []roachpb.Transaction) error
+	CleanupTxnIntentsAsync(context.Context, []*roachpb.Transaction) error
 }
 
 // txnPushAttempt pushes all old transactions that have unresolved intents on
@@ -160,7 +160,7 @@ func newTxnPushAttempt(
 func (a *txnPushAttempt) Run(ctx context.Context) {
 	defer a.Cancel()
 	if err := a.pushOldTxns(ctx); err != nil {
-		log.Error(ctx, errors.Wrap(err, "pushing old intents failed"))
+		log.Errorf(ctx, "pushing old intents failed: %v", err)
 	}
 }
 
@@ -176,7 +176,7 @@ func (a *txnPushAttempt) pushOldTxns(ctx context.Context) error {
 
 	// Inform the Processor of the results of the push for each transaction.
 	ops := make([]enginepb.MVCCLogicalOp, len(pushedTxns))
-	var toCleanup []roachpb.Transaction
+	var toCleanup []*roachpb.Transaction
 	for i, txn := range pushedTxns {
 		switch txn.Status {
 		case roachpb.PENDING, roachpb.STAGING:

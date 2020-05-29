@@ -16,18 +16,17 @@ import (
 	"math"
 	"math/big"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/cockroachdb/apd"
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/sql/lex"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
@@ -41,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeofday"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/timeutil/pgdate"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq/oid"
@@ -55,13 +53,21 @@ var (
 	errDecOutOfRange   = pgerror.New(pgcode.NumericValueOutOfRange, "decimal out of range")
 
 	// ErrDivByZero is reported on a division by zero.
-	ErrDivByZero = pgerror.New(pgcode.DivisionByZero, "division by zero")
+	ErrDivByZero       = pgerror.New(pgcode.DivisionByZero, "division by zero")
+	errSqrtOfNegNumber = pgerror.New(pgcode.InvalidArgumentForPowerFunction, "cannot take square root of a negative number")
 	// ErrZeroModulus is reported when computing the rest of a division by zero.
 	ErrZeroModulus = pgerror.New(pgcode.DivisionByZero, "zero modulus")
 
 	big10E6  = big.NewInt(1e6)
 	big10E10 = big.NewInt(1e10)
 )
+
+// NewCannotMixBitArraySizesError creates an error for the case when a bitwise
+// aggregate function is called on bit arrays with different sizes.
+func NewCannotMixBitArraySizesError(op string) error {
+	return pgerror.Newf(pgcode.StringDataLengthMismatch,
+		"cannot %s bit strings of different sizes", op)
+}
 
 // UnaryOp is a unary operator.
 type UnaryOp struct {
@@ -170,6 +176,42 @@ var UnaryOps = unaryOpFixups(map[UnaryOperator]unaryOpOverload{
 			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
 				ipAddr := MustBeDIPAddr(d).IPAddr
 				return NewDIPAddr(DIPAddr{ipAddr.Complement()}), nil
+			},
+		},
+	},
+
+	UnarySqrt: {
+		&UnaryOp{
+			Typ:        types.Float,
+			ReturnType: types.Float,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				return Sqrt(float64(*d.(*DFloat)))
+			},
+		},
+		&UnaryOp{
+			Typ:        types.Decimal,
+			ReturnType: types.Decimal,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				dec := &d.(*DDecimal).Decimal
+				return DecimalSqrt(dec)
+			},
+		},
+	},
+
+	UnaryCbrt: {
+		&UnaryOp{
+			Typ:        types.Float,
+			ReturnType: types.Float,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				return Cbrt(float64(*d.(*DFloat)))
+			},
+		},
+		&UnaryOp{
+			Typ:        types.Decimal,
+			ReturnType: types.Decimal,
+			Fn: func(_ *EvalContext, d Datum) (Datum, error) {
+				dec := &d.(*DDecimal).Decimal
+				return DecimalCbrt(dec)
 			},
 		},
 	},
@@ -382,11 +424,6 @@ func getJSONPath(j DJSON, ary DArray) (Datum, error) {
 	return &DJSON{result}, nil
 }
 
-func newCannotMixBitArraySizesError(op string) error {
-	return pgerror.Newf(pgcode.StringDataLengthMismatch,
-		"cannot %s bit strings of different sizes", op)
-}
-
 // BinOps contains the binary operations indexed by operation type.
 var BinOps = map[BinaryOperator]binOpOverload{
 	Bitand: {
@@ -406,7 +443,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				lhs := MustBeDBitArray(left)
 				rhs := MustBeDBitArray(right)
 				if lhs.BitLen() != rhs.BitLen() {
-					return nil, newCannotMixBitArraySizesError("AND")
+					return nil, NewCannotMixBitArraySizesError("AND")
 				}
 				return &DBitArray{
 					BitArray: bitarray.And(lhs.BitArray, rhs.BitArray),
@@ -443,7 +480,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				lhs := MustBeDBitArray(left)
 				rhs := MustBeDBitArray(right)
 				if lhs.BitLen() != rhs.BitLen() {
-					return nil, newCannotMixBitArraySizesError("OR")
+					return nil, NewCannotMixBitArraySizesError("OR")
 				}
 				return &DBitArray{
 					BitArray: bitarray.Or(lhs.BitArray, rhs.BitArray),
@@ -480,7 +517,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 				lhs := MustBeDBitArray(left)
 				rhs := MustBeDBitArray(right)
 				if lhs.BitLen() != rhs.BitLen() {
-					return nil, newCannotMixBitArraySizesError("XOR")
+					return nil, NewCannotMixBitArraySizesError("XOR")
 				}
 				return &DBitArray{
 					BitArray: bitarray.Xor(lhs.BitArray, rhs.BitArray),
@@ -584,7 +621,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := time.Duration(*right.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(leftTime.Add(t), time.Microsecond), nil
+				return MakeDTimestamp(leftTime.Add(t), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -597,7 +634,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := time.Duration(*left.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(rightTime.Add(t), time.Microsecond), nil
+				return MakeDTimestamp(rightTime.Add(t), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -610,7 +647,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := leftTime.Add(right.(*DTimeTZ).ToDuration())
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -623,7 +660,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := rightTime.Add(left.(*DTimeTZ).ToDuration())
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -670,7 +707,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Timestamp,
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return MakeDTimestamp(duration.Add(
-					left.(*DTimestamp).Time, right.(*DInterval).Duration), time.Microsecond), nil
+					left.(*DTimestamp).Time, right.(*DInterval).Duration), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -679,7 +716,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Timestamp,
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return MakeDTimestamp(duration.Add(
-					right.(*DTimestamp).Time, left.(*DInterval).Duration), time.Microsecond), nil
+					right.(*DTimestamp).Time, left.(*DInterval).Duration), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -689,7 +726,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				// Convert time to be in the given timezone, as math relies on matching timezones..
 				t := duration.Add(left.(*DTimestampTZ).Time.In(ctx.GetLocation()), right.(*DInterval).Duration)
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -699,7 +736,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				// Convert time to be in the given timezone, as math relies on matching timezones..
 				t := duration.Add(right.(*DTimestampTZ).Time.In(ctx.GetLocation()), left.(*DInterval).Duration)
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -720,7 +757,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := duration.Add(leftTime, right.(*DInterval).Duration)
-				return MakeDTimestamp(t, time.Microsecond), nil
+				return MakeDTimestamp(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -733,7 +770,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := duration.Add(rightTime, left.(*DInterval).Duration)
-				return MakeDTimestamp(t, time.Microsecond), nil
+				return MakeDTimestamp(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -857,7 +894,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := time.Duration(*right.(*DTime)) * time.Microsecond
-				return MakeDTimestamp(leftTime.Add(-1*t), time.Microsecond), nil
+				return MakeDTimestamp(leftTime.Add(-1*t), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -896,7 +933,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				// These two quantities aren't directly comparable. Convert the
 				// TimestampTZ to a timestamp first.
-				nanos := left.(*DTimestamp).Sub(right.(*DTimestampTZ).stripTimeZone(ctx).Time).Nanoseconds()
+				stripped, err := right.(*DTimestampTZ).stripTimeZone(ctx)
+				if err != nil {
+					return nil, err
+				}
+				nanos := left.(*DTimestamp).Sub(stripped.Time).Nanoseconds()
 				return &DInterval{Duration: duration.MakeDuration(nanos, 0, 0)}, nil
 			},
 		},
@@ -907,7 +948,11 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			Fn: func(ctx *EvalContext, left Datum, right Datum) (Datum, error) {
 				// These two quantities aren't directly comparable. Convert the
 				// TimestampTZ to a timestamp first.
-				nanos := left.(*DTimestampTZ).stripTimeZone(ctx).Sub(right.(*DTimestamp).Time).Nanoseconds()
+				stripped, err := left.(*DTimestampTZ).stripTimeZone(ctx)
+				if err != nil {
+					return nil, err
+				}
+				nanos := stripped.Sub(right.(*DTimestamp).Time).Nanoseconds()
 				return &DInterval{Duration: duration.MakeDuration(nanos, 0, 0)}, nil
 			},
 		},
@@ -936,7 +981,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 			ReturnType: types.Timestamp,
 			Fn: func(_ *EvalContext, left Datum, right Datum) (Datum, error) {
 				return MakeDTimestamp(duration.Add(
-					left.(*DTimestamp).Time, right.(*DInterval).Duration.Mul(-1)), time.Microsecond), nil
+					left.(*DTimestamp).Time, right.(*DInterval).Duration.Mul(-1)), time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -948,7 +993,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					left.(*DTimestampTZ).Time.In(ctx.GetLocation()),
 					right.(*DInterval).Duration.Mul(-1),
 				)
-				return MakeDTimestampTZ(t, time.Microsecond), nil
+				return MakeDTimestampTZ(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -961,7 +1006,7 @@ var BinOps = map[BinaryOperator]binOpOverload{
 					return nil, err
 				}
 				t := duration.Add(leftTime, right.(*DInterval).Duration.Mul(-1))
-				return MakeDTimestamp(t, time.Microsecond), nil
+				return MakeDTimestamp(t, time.Microsecond)
 			},
 		},
 		&BinOp{
@@ -1763,6 +1808,16 @@ func cmpOpFixups(cmpOps map[ComparisonOperator]cmpOpOverload) map[ComparisonOper
 			RightType: types.MakeArray(t),
 			Fn:        cmpOpScalarEQFn,
 		})
+		cmpOps[LE] = append(cmpOps[LE], &CmpOp{
+			LeftType:  types.MakeArray(t),
+			RightType: types.MakeArray(t),
+			Fn:        cmpOpScalarLEFn,
+		})
+		cmpOps[LT] = append(cmpOps[LT], &CmpOp{
+			LeftType:  types.MakeArray(t),
+			RightType: types.MakeArray(t),
+			Fn:        cmpOpScalarLTFn,
+		})
 
 		cmpOps[IsNotDistinctFrom] = append(cmpOps[IsNotDistinctFrom], &CmpOp{
 			LeftType:     types.MakeArray(t),
@@ -1824,12 +1879,15 @@ func makeIsFn(a, b *types.T) *CmpOp {
 var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 	EQ: {
 		// Single-type comparisons.
+		makeEqFn(types.AnyEnum, types.AnyEnum),
 		makeEqFn(types.Bool, types.Bool),
 		makeEqFn(types.Bytes, types.Bytes),
 		makeEqFn(types.Date, types.Date),
 		makeEqFn(types.Decimal, types.Decimal),
 		makeEqFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeEqFn(types.Float, types.Float),
+		makeEqFn(types.Geography, types.Geography),
+		makeEqFn(types.Geometry, types.Geometry),
 		makeEqFn(types.INet, types.INet),
 		makeEqFn(types.Int, types.Int),
 		makeEqFn(types.Interval, types.Interval),
@@ -1871,12 +1929,15 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 
 	LT: {
 		// Single-type comparisons.
+		makeLtFn(types.AnyEnum, types.AnyEnum),
 		makeLtFn(types.Bool, types.Bool),
 		makeLtFn(types.Bytes, types.Bytes),
 		makeLtFn(types.Date, types.Date),
 		makeLtFn(types.Decimal, types.Decimal),
 		makeLtFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeLtFn(types.Float, types.Float),
+		makeLtFn(types.Geography, types.Geography),
+		makeLtFn(types.Geometry, types.Geometry),
 		makeLtFn(types.INet, types.INet),
 		makeLtFn(types.Int, types.Int),
 		makeLtFn(types.Interval, types.Interval),
@@ -1917,12 +1978,15 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 
 	LE: {
 		// Single-type comparisons.
+		makeLeFn(types.AnyEnum, types.AnyEnum),
 		makeLeFn(types.Bool, types.Bool),
 		makeLeFn(types.Bytes, types.Bytes),
 		makeLeFn(types.Date, types.Date),
 		makeLeFn(types.Decimal, types.Decimal),
 		makeLeFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeLeFn(types.Float, types.Float),
+		makeLeFn(types.Geography, types.Geography),
+		makeLeFn(types.Geometry, types.Geometry),
 		makeLeFn(types.INet, types.INet),
 		makeLeFn(types.Int, types.Int),
 		makeLeFn(types.Interval, types.Interval),
@@ -1971,12 +2035,15 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 			isPreferred: true,
 		},
 		// Single-type comparisons.
+		makeIsFn(types.AnyEnum, types.AnyEnum),
 		makeIsFn(types.Bool, types.Bool),
 		makeIsFn(types.Bytes, types.Bytes),
 		makeIsFn(types.Date, types.Date),
 		makeIsFn(types.Decimal, types.Decimal),
 		makeIsFn(types.AnyCollatedString, types.AnyCollatedString),
 		makeIsFn(types.Float, types.Float),
+		makeIsFn(types.Geography, types.Geography),
+		makeIsFn(types.Geometry, types.Geometry),
 		makeIsFn(types.INet, types.INet),
 		makeIsFn(types.Int, types.Int),
 		makeIsFn(types.Interval, types.Interval),
@@ -2021,6 +2088,7 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 	},
 
 	In: {
+		makeEvalTupleIn(types.AnyEnum),
 		makeEvalTupleIn(types.Bool),
 		makeEvalTupleIn(types.Bytes),
 		makeEvalTupleIn(types.Date),
@@ -2028,6 +2096,8 @@ var CmpOps = cmpOpFixups(map[ComparisonOperator]cmpOpOverload{
 		makeEvalTupleIn(types.AnyCollatedString),
 		makeEvalTupleIn(types.AnyTuple),
 		makeEvalTupleIn(types.Float),
+		makeEvalTupleIn(types.Geography),
+		makeEvalTupleIn(types.Geometry),
 		makeEvalTupleIn(types.INet),
 		makeEvalTupleIn(types.Int),
 		makeEvalTupleIn(types.Interval),
@@ -2630,6 +2700,17 @@ type EvalSessionAccessor interface {
 	HasAdminRole(ctx context.Context) (bool, error)
 }
 
+// ClientNoticeSender is a limited interface to send notices to the
+// client.
+//
+// TODO(knz): as of this writing, the implementations of this
+// interface only work on the gateway node (i.e. not from
+// distributed processors).
+type ClientNoticeSender interface {
+	// SendClientNotice sends a notice out-of-band to the client.
+	SendClientNotice(ctx context.Context, notice error)
+}
+
 // InternalExecutor is a subset of sqlutil.InternalExecutor (which, in turn, is
 // implemented by sql.InternalExecutor) used by this sem/tree package which
 // can't even import sqlutil.
@@ -2694,6 +2775,19 @@ type SequenceOperators interface {
 	SetSequenceValue(ctx context.Context, seqName *TableName, newVal int64, isCalled bool) error
 }
 
+// TenantOperator is capable of interacting with tenant state, allowing SQL
+// builtin functions to create and destroy tenants. The methods will return
+// errors when run by any tenant other than the system tenant.
+type TenantOperator interface {
+	// CreateTenant attempts to install a new tenant in the system. It returns
+	// an error if the tenant already exists.
+	CreateTenant(ctx context.Context, tenantID uint64, tenantInfo []byte) error
+
+	// DestroyTenant attempts to uninstall an existing tenant from the system.
+	// It returns an error if the tenant does not exist.
+	DestroyTenant(ctx context.Context, tenantID uint64) error
+}
+
 // EvalContextTestingKnobs contains test knobs.
 type EvalContextTestingKnobs struct {
 	// AssertFuncExprReturnTypes indicates whether FuncExpr evaluations
@@ -2751,8 +2845,9 @@ type EvalContext struct {
 
 	Settings    *cluster.Settings
 	ClusterID   uuid.UUID
-	NodeID      roachpb.NodeID
 	ClusterName string
+	NodeID      *base.SQLIDContainer
+	Codec       keys.SQLCodec
 
 	// Locality contains the location of the current node as a set of user-defined
 	// key/value pairs, ordered from most inclusive to least inclusive. If there
@@ -2805,7 +2900,17 @@ type EvalContext struct {
 
 	SessionAccessor EvalSessionAccessor
 
+	ClientNoticeSender ClientNoticeSender
+
 	Sequence SequenceOperators
+
+	Tenant TenantOperator
+
+	// DistSQLTypeResolver is a type resolver used during execution of DistSQL
+	// flows. It is limited to only provide access to types via ID, meaning that
+	// it cannot perform resolution of qualified names into types. It will be nil
+	// when not in the context of a DistSQL flow.
+	DistSQLTypeResolver TypeReferenceResolver
 
 	// The transaction in which the statement is executing.
 	Txn *kv.Txn
@@ -2829,6 +2934,16 @@ type EvalContext struct {
 	TestingKnobs EvalContextTestingKnobs
 
 	Mon *mon.BytesMonitor
+
+	// SingleDatumAggMemAccount is a memory account that all aggregate builtins
+	// that store a single datum will share to account for the memory needed to
+	// perform the aggregation (i.e. memory not reported by AggregateFunc.Size
+	// method). This memory account exists so that such aggregate functions
+	// could "batch" their reservations - otherwise, we end up a situation
+	// where each aggregate function struct grows its own memory account by
+	// tiny amount, yet the account reserves a lot more resulting in
+	// significantly overestimating the memory usage.
+	SingleDatumAggMemAccount *mon.BoundAccount
 }
 
 // MakeTestingEvalContext returns an EvalContext that includes a MemoryMonitor.
@@ -2850,9 +2965,11 @@ func MakeTestingEvalContext(st *cluster.Settings) EvalContext {
 // EvalContext so do not start or close the memory monitor.
 func MakeTestingEvalContextWithMon(st *cluster.Settings, monitor *mon.BytesMonitor) EvalContext {
 	ctx := EvalContext{
+		Codec:       keys.SystemSQLCodec,
 		Txn:         &kv.Txn{},
 		SessionData: &sessiondata.SessionData{},
 		Settings:    st,
+		NodeID:      base.TestingIDContainer,
 	}
 	monitor.Start(context.Background(), nil /* pool */, mon.MakeStandaloneBudget(math.MaxInt64))
 	ctx.Mon = monitor
@@ -2938,6 +3055,11 @@ func TimestampToDecimal(ts hlc.Timestamp) *DDecimal {
 	val.Mul(val, big10E10)
 	val.Add(val, big.NewInt(int64(ts.Logical)))
 
+	// val must be positive. If it was set to a negative value above,
+	// transfer the sign to res.Negative.
+	res.Negative = val.Sign() < 0
+	val.Abs(val)
+
 	// Shift 10 decimals to the right, so that the logical
 	// field appears as fractional part.
 	res.Decimal.Exponent = -10
@@ -2948,7 +3070,7 @@ func TimestampToDecimal(ts hlc.Timestamp) *DDecimal {
 // inexact DTimestamp by dropping the logical counter and using the wall
 // time at the microsecond precision.
 func TimestampToInexactDTimestamp(ts hlc.Timestamp) *DTimestamp {
-	return MakeDTimestamp(timeutil.Unix(0, ts.WallTime), time.Microsecond)
+	return MustMakeDTimestamp(timeutil.Unix(0, ts.WallTime), time.Microsecond)
 }
 
 // GetRelativeParseTime implements ParseTimeContext.
@@ -2968,7 +3090,7 @@ func (ctx *EvalContext) GetTxnTimestamp(precision time.Duration) *DTimestampTZ {
 	if !ctx.PrepareOnly && ctx.TxnTimestamp.IsZero() {
 		panic(errors.AssertionFailedf("zero transaction timestamp in EvalContext"))
 	}
-	return MakeDTimestampTZ(ctx.GetRelativeParseTime(), precision)
+	return MustMakeDTimestampTZ(ctx.GetRelativeParseTime(), precision)
 }
 
 // GetTxnTimestampNoZone retrieves the current transaction timestamp as per
@@ -2982,7 +3104,7 @@ func (ctx *EvalContext) GetTxnTimestampNoZone(precision time.Duration) *DTimesta
 	// Move the time to UTC, but keeping the location's time.
 	t := ctx.GetRelativeParseTime()
 	_, offsetSecs := t.Zone()
-	return MakeDTimestamp(t.Add(time.Second*time.Duration(offsetSecs)).In(time.UTC), precision)
+	return MustMakeDTimestamp(t.Add(time.Second*time.Duration(offsetSecs)).In(time.UTC), precision)
 }
 
 // GetTxnTime retrieves the current transaction time as per
@@ -3194,7 +3316,7 @@ func queryOidWithJoin(
 			info.tableName, info.nameCol, info.tableName, joinClause, queryCol, additionalWhere),
 		d)
 	if err != nil {
-		if _, ok := errors.UnwrapAll(err).(*MultipleResultsError); ok {
+		if errors.HasType(err, (*MultipleResultsError)(nil)) {
 			return nil, pgerror.Newf(pgcode.AmbiguousAlias,
 				"more than one %s named %s", info.objName, d)
 		}
@@ -3224,624 +3346,7 @@ func (expr *CastExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return d, nil
 	}
 	d = UnwrapDatum(ctx, d)
-	return PerformCast(ctx, d, expr.Type)
-}
-
-// PerformCast performs a cast from the provided Datum to the specified
-// types.T.
-func PerformCast(ctx *EvalContext, d Datum, t *types.T) (Datum, error) {
-	switch t.Family() {
-	case types.BitFamily:
-		switch v := d.(type) {
-		case *DBitArray:
-			if t.Width() == 0 || v.BitLen() == uint(t.Width()) {
-				return d, nil
-			}
-			var a DBitArray
-			a.BitArray = v.BitArray.ToWidth(uint(t.Width()))
-			return &a, nil
-		case *DInt:
-			return NewDBitArrayFromInt(int64(*v), uint(t.Width()))
-		case *DString:
-			res, err := bitarray.Parse(string(*v))
-			if err != nil {
-				return nil, err
-			}
-			if t.Width() > 0 {
-				res = res.ToWidth(uint(t.Width()))
-			}
-			return &DBitArray{BitArray: res}, nil
-		case *DCollatedString:
-			res, err := bitarray.Parse(v.Contents)
-			if err != nil {
-				return nil, err
-			}
-			if t.Width() > 0 {
-				res = res.ToWidth(uint(t.Width()))
-			}
-			return &DBitArray{BitArray: res}, nil
-		}
-
-	case types.BoolFamily:
-		switch v := d.(type) {
-		case *DBool:
-			return d, nil
-		case *DInt:
-			return MakeDBool(*v != 0), nil
-		case *DFloat:
-			return MakeDBool(*v != 0), nil
-		case *DDecimal:
-			return MakeDBool(v.Sign() != 0), nil
-		case *DString:
-			return ParseDBool(string(*v))
-		case *DCollatedString:
-			return ParseDBool(v.Contents)
-		}
-
-	case types.IntFamily:
-		var res *DInt
-		switch v := d.(type) {
-		case *DBitArray:
-			res = v.AsDInt(uint(t.Width()))
-		case *DBool:
-			if *v {
-				res = NewDInt(1)
-			} else {
-				res = DZero
-			}
-		case *DInt:
-			// TODO(knz): enforce the coltype width here.
-			res = v
-		case *DFloat:
-			f := float64(*v)
-			// Use `<=` and `>=` here instead of just `<` and `>` because when
-			// math.MaxInt64 and math.MinInt64 are converted to float64s, they are
-			// rounded to numbers with larger absolute values. Note that the first
-			// next FP value after and strictly greater than float64(math.MinInt64)
-			// is -9223372036854774784 (= float64(math.MinInt64)+513) and the first
-			// previous value and strictly smaller than float64(math.MaxInt64)
-			// is 9223372036854774784 (= float64(math.MaxInt64)-513), and both are
-			// convertible to int without overflow.
-			if math.IsNaN(f) || f <= float64(math.MinInt64) || f >= float64(math.MaxInt64) {
-				return nil, ErrIntOutOfRange
-			}
-			res = NewDInt(DInt(f))
-		case *DDecimal:
-			d := ctx.getTmpDec()
-			_, err := DecimalCtx.RoundToIntegralValue(d, &v.Decimal)
-			if err != nil {
-				return nil, err
-			}
-			i, err := d.Int64()
-			if err != nil {
-				return nil, ErrIntOutOfRange
-			}
-			res = NewDInt(DInt(i))
-		case *DString:
-			var err error
-			if res, err = ParseDInt(string(*v)); err != nil {
-				return nil, err
-			}
-		case *DCollatedString:
-			var err error
-			if res, err = ParseDInt(v.Contents); err != nil {
-				return nil, err
-			}
-		case *DTimestamp:
-			res = NewDInt(DInt(v.Unix()))
-		case *DTimestampTZ:
-			res = NewDInt(DInt(v.Unix()))
-		case *DDate:
-			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
-			if !v.IsFinite() {
-				return nil, ErrIntOutOfRange
-			}
-			res = NewDInt(DInt(v.UnixEpochDays()))
-		case *DInterval:
-			iv, ok := v.AsInt64()
-			if !ok {
-				return nil, ErrIntOutOfRange
-			}
-			res = NewDInt(DInt(iv))
-		case *DOid:
-			res = &v.DInt
-		}
-		if res != nil {
-			return res, nil
-		}
-
-	case types.FloatFamily:
-		switch v := d.(type) {
-		case *DBool:
-			if *v {
-				return NewDFloat(1), nil
-			}
-			return NewDFloat(0), nil
-		case *DInt:
-			return NewDFloat(DFloat(*v)), nil
-		case *DFloat:
-			return d, nil
-		case *DDecimal:
-			f, err := v.Float64()
-			if err != nil {
-				return nil, ErrFloatOutOfRange
-			}
-			return NewDFloat(DFloat(f)), nil
-		case *DString:
-			return ParseDFloat(string(*v))
-		case *DCollatedString:
-			return ParseDFloat(v.Contents)
-		case *DTimestamp:
-			micros := float64(v.Nanosecond() / int(time.Microsecond))
-			return NewDFloat(DFloat(float64(v.Unix()) + micros*1e-6)), nil
-		case *DTimestampTZ:
-			micros := float64(v.Nanosecond() / int(time.Microsecond))
-			return NewDFloat(DFloat(float64(v.Unix()) + micros*1e-6)), nil
-		case *DDate:
-			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
-			if !v.IsFinite() {
-				return nil, ErrFloatOutOfRange
-			}
-			return NewDFloat(DFloat(float64(v.UnixEpochDays()))), nil
-		case *DInterval:
-			return NewDFloat(DFloat(v.AsFloat64())), nil
-		}
-
-	case types.DecimalFamily:
-		var dd DDecimal
-		var err error
-		unset := false
-		switch v := d.(type) {
-		case *DBool:
-			if *v {
-				dd.SetFinite(1, 0)
-			}
-		case *DInt:
-			dd.SetFinite(int64(*v), 0)
-		case *DDate:
-			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
-			if !v.IsFinite() {
-				return nil, errDecOutOfRange
-			}
-			dd.SetFinite(v.UnixEpochDays(), 0)
-		case *DFloat:
-			_, err = dd.SetFloat64(float64(*v))
-		case *DDecimal:
-			// Small optimization to avoid copying into dd in normal case.
-			if t.Precision() == 0 {
-				return d, nil
-			}
-			dd.Set(&v.Decimal)
-		case *DString:
-			err = dd.SetString(string(*v))
-		case *DCollatedString:
-			err = dd.SetString(v.Contents)
-		case *DTimestamp:
-			val := &dd.Coeff
-			val.SetInt64(v.Unix())
-			val.Mul(val, big10E6)
-			micros := v.Nanosecond() / int(time.Microsecond)
-			val.Add(val, big.NewInt(int64(micros)))
-			dd.Exponent = -6
-		case *DTimestampTZ:
-			val := &dd.Coeff
-			val.SetInt64(v.Unix())
-			val.Mul(val, big10E6)
-			micros := v.Nanosecond() / int(time.Microsecond)
-			val.Add(val, big.NewInt(int64(micros)))
-			dd.Exponent = -6
-		case *DInterval:
-			v.AsBigInt(&dd.Coeff)
-			dd.Exponent = -9
-		default:
-			unset = true
-		}
-		if err != nil {
-			return nil, err
-		}
-		if !unset {
-			err = LimitDecimalWidth(&dd.Decimal, int(t.Precision()), int(t.Scale()))
-			return &dd, err
-		}
-
-	case types.StringFamily, types.CollatedStringFamily:
-		var s string
-		switch t := d.(type) {
-		case *DBitArray:
-			s = t.BitArray.String()
-		case *DFloat:
-			s = strconv.FormatFloat(float64(*t), 'g',
-				ctx.SessionData.DataConversion.GetFloatPrec(), 64)
-		case *DBool, *DInt, *DDecimal:
-			s = d.String()
-		case *DTimestamp, *DDate, *DTime, *DTimeTZ:
-			s = AsStringWithFlags(d, FmtBareStrings)
-		case *DTimestampTZ:
-			// Convert to context timezone for correct display.
-			s = AsStringWithFlags(
-				MakeDTimestampTZ(t.In(ctx.GetLocation()), time.Microsecond),
-				FmtBareStrings,
-			)
-		case *DTuple:
-			s = AsStringWithFlags(d, FmtPgwireText)
-		case *DArray:
-			s = AsStringWithFlags(d, FmtPgwireText)
-		case *DInterval:
-			// When converting an interval to string, we need a string representation
-			// of the duration (e.g. "5s") and not of the interval itself (e.g.
-			// "INTERVAL '5s'").
-			s = t.ValueAsString()
-		case *DUuid:
-			s = t.UUID.String()
-		case *DIPAddr:
-			s = AsStringWithFlags(d, FmtBareStrings)
-		case *DString:
-			s = string(*t)
-		case *DCollatedString:
-			s = t.Contents
-		case *DBytes:
-			s = lex.EncodeByteArrayToRawBytes(string(*t),
-				ctx.SessionData.DataConversion.BytesEncodeFormat, false /* skipHexPrefix */)
-		case *DOid:
-			s = t.String()
-		case *DJSON:
-			s = t.JSON.String()
-		}
-		switch t.Family() {
-		case types.StringFamily:
-			if t.Oid() == oid.T_name {
-				return NewDName(s), nil
-			}
-
-			// If the string type specifies a limit we truncate to that limit:
-			//   'hello'::CHAR(2) -> 'he'
-			// This is true of all the string type variants.
-			if t.Width() > 0 && int(t.Width()) < len(s) {
-				s = s[:t.Width()]
-			}
-			return NewDString(s), nil
-		case types.CollatedStringFamily:
-			// Ditto truncation like for TString.
-			if t.Width() > 0 && int(t.Width()) < len(s) {
-				s = s[:t.Width()]
-			}
-			return NewDCollatedString(s, t.Locale(), &ctx.CollationEnv)
-		}
-
-	case types.BytesFamily:
-		switch t := d.(type) {
-		case *DString:
-			return ParseDByte(string(*t))
-		case *DCollatedString:
-			return NewDBytes(DBytes(t.Contents)), nil
-		case *DUuid:
-			return NewDBytes(DBytes(t.GetBytes())), nil
-		case *DBytes:
-			return d, nil
-		}
-
-	case types.UuidFamily:
-		switch t := d.(type) {
-		case *DString:
-			return ParseDUuidFromString(string(*t))
-		case *DCollatedString:
-			return ParseDUuidFromString(t.Contents)
-		case *DBytes:
-			return ParseDUuidFromBytes([]byte(*t))
-		case *DUuid:
-			return d, nil
-		}
-
-	case types.INetFamily:
-		switch t := d.(type) {
-		case *DString:
-			return ParseDIPAddrFromINetString(string(*t))
-		case *DCollatedString:
-			return ParseDIPAddrFromINetString(t.Contents)
-		case *DIPAddr:
-			return d, nil
-		}
-
-	case types.DateFamily:
-		switch d := d.(type) {
-		case *DString:
-			return ParseDDate(ctx, string(*d))
-		case *DCollatedString:
-			return ParseDDate(ctx, d.Contents)
-		case *DDate:
-			return d, nil
-		case *DInt:
-			// TODO(mjibson): This cast is unsupported by postgres. Should we remove ours?
-			t, err := pgdate.MakeDateFromUnixEpoch(int64(*d))
-			return NewDDate(t), err
-		case *DTimestampTZ:
-			return NewDDateFromTime(d.Time.In(ctx.GetLocation()))
-		case *DTimestamp:
-			return NewDDateFromTime(d.Time)
-		}
-
-	case types.TimeFamily:
-		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
-		switch d := d.(type) {
-		case *DString:
-			return ParseDTime(ctx, string(*d), roundTo)
-		case *DCollatedString:
-			return ParseDTime(ctx, d.Contents, roundTo)
-		case *DTime:
-			return d.Round(roundTo), nil
-		case *DTimeTZ:
-			return MakeDTime(d.TimeOfDay.Round(roundTo)), nil
-		case *DTimestamp:
-			return MakeDTime(timeofday.FromTime(d.Time).Round(roundTo)), nil
-		case *DTimestampTZ:
-			// Strip time zone. Times don't carry their location.
-			return MakeDTime(timeofday.FromTime(d.stripTimeZone(ctx).Time).Round(roundTo)), nil
-		case *DInterval:
-			return MakeDTime(timeofday.Min.Add(d.Duration).Round(roundTo)), nil
-		}
-
-	case types.TimeTZFamily:
-		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
-		switch d := d.(type) {
-		case *DString:
-			return ParseDTimeTZ(ctx, string(*d), roundTo)
-		case *DCollatedString:
-			return ParseDTimeTZ(ctx, d.Contents, roundTo)
-		case *DTime:
-			return NewDTimeTZFromLocation(timeofday.TimeOfDay(*d).Round(roundTo), ctx.GetLocation()), nil
-		case *DTimeTZ:
-			return d.Round(roundTo), nil
-		case *DTimestampTZ:
-			return NewDTimeTZFromTime(d.Time.In(ctx.GetLocation()).Round(roundTo)), nil
-		}
-
-	case types.TimestampFamily:
-		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
-		// TODO(knz): Timestamp from float, decimal.
-		switch d := d.(type) {
-		case *DString:
-			return ParseDTimestamp(ctx, string(*d), roundTo)
-		case *DCollatedString:
-			return ParseDTimestamp(ctx, d.Contents, roundTo)
-		case *DDate:
-			t, err := d.ToTime()
-			return MakeDTimestamp(t, roundTo), err
-		case *DInt:
-			return MakeDTimestamp(timeutil.Unix(int64(*d), 0), roundTo), nil
-		case *DTimestamp:
-			return d.Round(roundTo), nil
-		case *DTimestampTZ:
-			// Strip time zone. Timestamps don't carry their location.
-			return d.stripTimeZone(ctx).Round(roundTo), nil
-		}
-
-	case types.TimestampTZFamily:
-		roundTo := TimeFamilyPrecisionToRoundDuration(t.Precision())
-		// TODO(knz): TimestampTZ from float, decimal.
-		switch d := d.(type) {
-		case *DString:
-			return ParseDTimestampTZ(ctx, string(*d), roundTo)
-		case *DCollatedString:
-			return ParseDTimestampTZ(ctx, d.Contents, roundTo)
-		case *DDate:
-			t, err := d.ToTime()
-			_, before := t.Zone()
-			_, after := t.In(ctx.GetLocation()).Zone()
-			return MakeDTimestampTZ(t.Add(time.Duration(before-after)*time.Second), roundTo), err
-		case *DTimestamp:
-			_, before := d.Time.Zone()
-			_, after := d.Time.In(ctx.GetLocation()).Zone()
-			return MakeDTimestampTZ(d.Time.Add(time.Duration(before-after)*time.Second), roundTo), nil
-		case *DInt:
-			return MakeDTimestampTZ(timeutil.Unix(int64(*d), 0), roundTo), nil
-		case *DTimestampTZ:
-			return d.Round(roundTo), nil
-		}
-
-	case types.IntervalFamily:
-		itm, err := t.IntervalTypeMetadata()
-		if err != nil {
-			return nil, err
-		}
-		switch v := d.(type) {
-		case *DString:
-			return ParseDIntervalWithTypeMetadata(string(*v), itm)
-		case *DCollatedString:
-			return ParseDIntervalWithTypeMetadata(v.Contents, itm)
-		case *DInt:
-			return NewDInterval(duration.FromInt64(int64(*v)), itm), nil
-		case *DFloat:
-			return NewDInterval(duration.FromFloat64(float64(*v)), itm), nil
-		case *DTime:
-			return NewDInterval(duration.MakeDuration(int64(*v)*1000, 0, 0), itm), nil
-		case *DDecimal:
-			d := ctx.getTmpDec()
-			dnanos := v.Decimal
-			dnanos.Exponent += 9
-			// We need HighPrecisionCtx because duration values can contain
-			// upward of 35 decimal digits and DecimalCtx only provides 25.
-			_, err := HighPrecisionCtx.Quantize(d, &dnanos, 0)
-			if err != nil {
-				return nil, err
-			}
-			if dnanos.Negative {
-				d.Coeff.Neg(&d.Coeff)
-			}
-			dv, ok := duration.FromBigInt(&d.Coeff)
-			if !ok {
-				return nil, errDecOutOfRange
-			}
-			return NewDInterval(dv, itm), nil
-		case *DInterval:
-			return NewDInterval(v.Duration, itm), nil
-		}
-	case types.JsonFamily:
-		switch v := d.(type) {
-		case *DString:
-			return ParseDJSON(string(*v))
-		case *DJSON:
-			return v, nil
-		}
-	case types.ArrayFamily:
-		switch v := d.(type) {
-		case *DString:
-			return ParseDArrayFromString(ctx, string(*v), t.ArrayContents())
-		case *DArray:
-			dcast := NewDArray(t.ArrayContents())
-			for _, e := range v.Array {
-				ecast := DNull
-				if e != DNull {
-					var err error
-					ecast, err = PerformCast(ctx, e, t.ArrayContents())
-					if err != nil {
-						return nil, err
-					}
-				}
-
-				if err := dcast.Append(ecast); err != nil {
-					return nil, err
-				}
-			}
-			return dcast, nil
-		}
-	case types.OidFamily:
-		switch v := d.(type) {
-		case *DOid:
-			switch t.Oid() {
-			case oid.T_oid:
-				return &DOid{semanticType: t, DInt: v.DInt}, nil
-			case oid.T_regtype:
-				// Mapping an oid to a regtype is easy: we have a hardcoded map.
-				typ, ok := types.OidToType[oid.Oid(v.DInt)]
-				ret := &DOid{semanticType: t, DInt: v.DInt}
-				if !ok {
-					return ret, nil
-				}
-				ret.name = typ.PGName()
-				return ret, nil
-			default:
-				oid, err := queryOid(ctx, t, v)
-				if err != nil {
-					oid = NewDOid(v.DInt)
-					oid.semanticType = t
-				}
-				return oid, nil
-			}
-		case *DInt:
-			switch t.Oid() {
-			case oid.T_oid:
-				return &DOid{semanticType: t, DInt: *v}, nil
-			default:
-				tmpOid := NewDOid(*v)
-				oid, err := queryOid(ctx, t, tmpOid)
-				if err != nil {
-					oid = tmpOid
-					oid.semanticType = t
-				}
-				return oid, nil
-			}
-		case *DString:
-			s := string(*v)
-			// Trim whitespace and unwrap outer quotes if necessary.
-			// This is required to mimic postgres.
-			s = strings.TrimSpace(s)
-			origS := s
-			if len(s) > 1 && s[0] == '"' && s[len(s)-1] == '"' {
-				s = s[1 : len(s)-1]
-			}
-
-			switch t.Oid() {
-			case oid.T_oid:
-				i, err := ParseDInt(s)
-				if err != nil {
-					return nil, err
-				}
-				return &DOid{semanticType: t, DInt: *i}, nil
-			case oid.T_regproc, oid.T_regprocedure:
-				// Trim procedure type parameters, e.g. `max(int)` becomes `max`.
-				// Postgres only does this when the cast is ::regprocedure, but we're
-				// going to always do it.
-				// We additionally do not yet implement disambiguation based on type
-				// parameters: we return the match iff there is exactly one.
-				s = pgSignatureRegexp.ReplaceAllString(s, "$1")
-				// Resolve function name.
-				substrs := strings.Split(s, ".")
-				if len(substrs) > 3 {
-					// A fully qualified function name in pg's dialect can contain
-					// at most 3 parts: db.schema.funname.
-					// For example mydb.pg_catalog.max().
-					// Anything longer is always invalid.
-					return nil, pgerror.Newf(pgcode.Syntax,
-						"invalid function name: %s", s)
-				}
-				name := UnresolvedName{NumParts: len(substrs)}
-				for i := 0; i < len(substrs); i++ {
-					name.Parts[i] = substrs[len(substrs)-1-i]
-				}
-				funcDef, err := name.ResolveFunction(ctx.SessionData.SearchPath)
-				if err != nil {
-					return nil, err
-				}
-				return queryOid(ctx, t, NewDString(funcDef.Name))
-			case oid.T_regtype:
-				parsedTyp, err := ctx.Planner.ParseType(s)
-				if err == nil {
-					return &DOid{
-						semanticType: t,
-						DInt:         DInt(parsedTyp.Oid()),
-						name:         parsedTyp.SQLStandardName(),
-					}, nil
-				}
-				// Fall back to searching pg_type, since we don't provide syntax for
-				// every postgres type that we understand OIDs for.
-				// Trim type modifiers, e.g. `numeric(10,3)` becomes `numeric`.
-				s = pgSignatureRegexp.ReplaceAllString(s, "$1")
-				dOid, missingTypeErr := queryOid(ctx, t, NewDString(s))
-				if missingTypeErr == nil {
-					return dOid, missingTypeErr
-				}
-				// Fall back to some special cases that we support for compatibility
-				// only. Client use syntax like 'sometype'::regtype to produce the oid
-				// for a type that they want to search a catalog table for. Since we
-				// don't support that type, we return an artificial OID that will never
-				// match anything.
-				switch s {
-				// We don't support triggers, but some tools search for them
-				// specifically.
-				case "trigger":
-				default:
-					return nil, missingTypeErr
-				}
-				return &DOid{
-					semanticType: t,
-					// Types we don't support get OID -1, so they won't match anything
-					// in catalogs.
-					DInt: -1,
-					name: s,
-				}, nil
-
-			case oid.T_regclass:
-				tn, err := ctx.Planner.ParseQualifiedTableName(origS)
-				if err != nil {
-					return nil, err
-				}
-				id, err := ctx.Planner.ResolveTableName(ctx.Ctx(), tn)
-				if err != nil {
-					return nil, err
-				}
-				return &DOid{
-					semanticType: t,
-					DInt:         DInt(id),
-					name:         tn.TableName.String(),
-				}, nil
-			default:
-				return queryOid(ctx, t, NewDString(s))
-			}
-		}
-	}
-
-	return nil, pgerror.Newf(
-		pgcode.CannotCoerce, "invalid cast: %s -> %s", d.ResolvedType(), t)
+	return PerformCast(ctx, d, expr.ResolvedType())
 }
 
 // Eval implements the TypedExpr interface.
@@ -4094,7 +3599,7 @@ func (expr *IsOfTypeExpr) Eval(ctx *EvalContext) (Datum, error) {
 	}
 	datumTyp := d.ResolvedType()
 
-	for _, t := range expr.Types {
+	for _, t := range expr.ResolvedTypes() {
 		if datumTyp.Equivalent(t) {
 			return MakeDBool(DBool(!expr.Not)), nil
 		}
@@ -4116,6 +3621,48 @@ func (expr *NotExpr) Eval(ctx *EvalContext) (Datum, error) {
 		return nil, err
 	}
 	return MakeDBool(!v), nil
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *IsNullExpr) Eval(ctx *EvalContext) (Datum, error) {
+	d, err := expr.Expr.(TypedExpr).Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d == DNull {
+		return MakeDBool(true), nil
+	}
+	if t, ok := d.(*DTuple); ok {
+		// A tuple IS NULL if all elements are NULL.
+		for _, tupleDatum := range t.D {
+			if tupleDatum != DNull {
+				return MakeDBool(false), nil
+			}
+		}
+		return MakeDBool(true), nil
+	}
+	return MakeDBool(false), nil
+}
+
+// Eval implements the TypedExpr interface.
+func (expr *IsNotNullExpr) Eval(ctx *EvalContext) (Datum, error) {
+	d, err := expr.Expr.(TypedExpr).Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if d == DNull {
+		return MakeDBool(false), nil
+	}
+	if t, ok := d.(*DTuple); ok {
+		// A tuple IS NOT NULL if all elements are not NULL.
+		for _, tupleDatum := range t.D {
+			if tupleDatum == DNull {
+				return MakeDBool(false), nil
+			}
+		}
+		return MakeDBool(true), nil
+	}
+	return MakeDBool(true), nil
 }
 
 // Eval implements the TypedExpr interface.
@@ -4359,6 +3906,21 @@ func (t *DInterval) Eval(_ *EvalContext) (Datum, error) {
 }
 
 // Eval implements the TypedExpr interface.
+func (t *DGeography) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
+func (t *DGeometry) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
+func (t *DEnum) Eval(_ *EvalContext) (Datum, error) {
+	return t, nil
+}
+
+// Eval implements the TypedExpr interface.
 func (t *DJSON) Eval(_ *EvalContext) (Datum, error) {
 	return t, nil
 }
@@ -4433,7 +3995,7 @@ func (t *Placeholder) Eval(ctx *EvalContext) (Datum, error) {
 		// type for the placeholder. In this case, we cast the expression to
 		// the desired type.
 		// TODO(jordan): introduce a restriction on what casts are allowed here.
-		cast := &CastExpr{Expr: e, Type: typ}
+		cast := NewTypedCastExpr(e, typ)
 		return cast.Eval(ctx)
 	}
 	return e.Eval(ctx)
@@ -5351,9 +4913,39 @@ func (c *CallbackValueGenerator) Next(ctx context.Context) (bool, error) {
 }
 
 // Values is part of the ValueGenerator interface.
-func (c *CallbackValueGenerator) Values() Datums {
-	return Datums{NewDInt(DInt(c.val))}
+func (c *CallbackValueGenerator) Values() (Datums, error) {
+	return Datums{NewDInt(DInt(c.val))}, nil
 }
 
 // Close is part of the ValueGenerator interface.
 func (c *CallbackValueGenerator) Close() {}
+
+// Sqrt returns the square root of x.
+func Sqrt(x float64) (*DFloat, error) {
+	if x < 0.0 {
+		return nil, errSqrtOfNegNumber
+	}
+	return NewDFloat(DFloat(math.Sqrt(x))), nil
+}
+
+// DecimalSqrt returns the square root of x.
+func DecimalSqrt(x *apd.Decimal) (*DDecimal, error) {
+	if x.Sign() < 0 {
+		return nil, errSqrtOfNegNumber
+	}
+	dd := &DDecimal{}
+	_, err := DecimalCtx.Sqrt(&dd.Decimal, x)
+	return dd, err
+}
+
+// Cbrt returns the cube root of x.
+func Cbrt(x float64) (*DFloat, error) {
+	return NewDFloat(DFloat(math.Cbrt(x))), nil
+}
+
+// DecimalCbrt returns the cube root of x.
+func DecimalCbrt(x *apd.Decimal) (*DDecimal, error) {
+	dd := &DDecimal{}
+	_, err := DecimalCtx.Cbrt(&dd.Decimal, x)
+	return dd, err
+}

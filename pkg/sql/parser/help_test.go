@@ -44,6 +44,12 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER TABLE blah RENAME TO blih ??`, `ALTER TABLE`},
 		{`ALTER TABLE blah SPLIT AT (SELECT 1) ??`, `ALTER TABLE`},
 
+		{`ALTER TYPE ??`, `ALTER TYPE`},
+		{`ALTER TYPE t ??`, `ALTER TYPE`},
+		{`ALTER TYPE t ADD VALUE ??`, `ALTER TYPE`},
+		{`ALTER TYPE t SET ??`, `ALTER TYPE`},
+		{`ALTER TYPE t RENAME ??`, `ALTER TYPE`},
+
 		{`ALTER INDEX foo@bar RENAME ??`, `ALTER INDEX`},
 		{`ALTER INDEX foo@bar RENAME TO blih ??`, `ALTER INDEX`},
 		{`ALTER INDEX foo@bar SPLIT ??`, `ALTER INDEX`},
@@ -63,8 +69,8 @@ func TestContextualHelp(t *testing.T) {
 		{`ALTER SEQUENCE blah RENAME ??`, `ALTER SEQUENCE`},
 		{`ALTER SEQUENCE blah RENAME TO blih ??`, `ALTER SEQUENCE`},
 
-		{`ALTER USER IF ??`, `ALTER USER`},
-		{`ALTER USER foo WITH PASSWORD ??`, `ALTER USER`},
+		{`ALTER USER IF ??`, `ALTER ROLE`},
+		{`ALTER USER foo WITH PASSWORD ??`, `ALTER ROLE`},
 
 		{`ALTER ROLE bleh ?? WITH NOCREATEROLE`, `ALTER ROLE`},
 
@@ -102,8 +108,8 @@ func TestContextualHelp(t *testing.T) {
 		{`CREATE DATABASE IF NOT ??`, `CREATE DATABASE`},
 		{`CREATE DATABASE blih ??`, `CREATE DATABASE`},
 
-		{`CREATE USER blih ??`, `CREATE USER`},
-		{`CREATE USER blih WITH ??`, `CREATE USER`},
+		{`CREATE USER blih ??`, `CREATE ROLE`},
+		{`CREATE USER blih WITH ??`, `CREATE ROLE`},
 
 		{`CREATE ROLE bleh ??`, `CREATE ROLE`},
 		{`CREATE ROLE bleh ?? WITH CREATEROLE`, `CREATE ROLE`},
@@ -125,6 +131,9 @@ func TestContextualHelp(t *testing.T) {
 		{`CREATE TABLE blah AS (SELECT 1) ??`, `CREATE TABLE`},
 		{`CREATE TABLE blah AS SELECT 1 ??`, `SELECT`},
 
+		{`CREATE TYPE blah AS ENUM ??`, `CREATE TYPE`},
+		{`DROP TYPE ??`, `DROP TYPE`},
+
 		{`CREATE SCHEMA IF ??`, `CREATE SCHEMA`},
 		{`CREATE SCHEMA IF NOT ??`, `CREATE SCHEMA`},
 		{`CREATE SCHEMA bli ??`, `CREATE SCHEMA`},
@@ -145,9 +154,9 @@ func TestContextualHelp(t *testing.T) {
 		{`DROP INDEX blah, ??`, `DROP INDEX`},
 		{`DROP INDEX blah@blih ??`, `DROP INDEX`},
 
-		{`DROP USER ??`, `DROP USER`},
-		{`DROP USER IF ??`, `DROP USER`},
-		{`DROP USER IF EXISTS bluh ??`, `DROP USER`},
+		{`DROP USER ??`, `DROP ROLE`},
+		{`DROP USER IF ??`, `DROP ROLE`},
+		{`DROP USER IF EXISTS bluh ??`, `DROP ROLE`},
 
 		{`DROP ROLE ??`, `DROP ROLE`},
 		{`DROP ROLE IF ??`, `DROP ROLE`},

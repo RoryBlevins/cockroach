@@ -31,6 +31,10 @@ func SchemaNewTypeCounter(t string) telemetry.Counter {
 }
 
 var (
+	// CreateInterleavedTableCounter is to be incremented every time an
+	// interleaved table is being created.
+	CreateInterleavedTableCounter = telemetry.GetCounterOnce("sql.schema.create_interleaved_table")
+
 	// CreateTempTableCounter is to be incremented every time a TEMP TABLE
 	// has been created.
 	CreateTempTableCounter = telemetry.GetCounterOnce("sql.schema.create_temp_table")
@@ -52,6 +56,16 @@ var (
 	// InvertedIndexCounter is to be incremented every time an inverted
 	// index is created.
 	InvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.inverted_index")
+
+	// GeographyInvertedIndexCounter is to be incremented every time a
+	// geography inverted index is created. These are a subset of the
+	// indexes counted in InvertedIndexCounter.
+	GeographyInvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.geography_inverted_index")
+
+	// GeometryInvertedIndexCounter is to be incremented every time a
+	// geometry inverted index is created. These are a subset of the
+	// indexes counted in InvertedIndexCounter.
+	GeometryInvertedIndexCounter = telemetry.GetCounterOnce("sql.schema.geometry_inverted_index")
 )
 
 var (

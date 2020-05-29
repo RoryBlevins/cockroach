@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 )
 
 // emitHelper is a utility wrapper on top of ProcOutputHelper.EmitRow().
@@ -199,7 +199,10 @@ func NewProcessor(
 		if err := checkNumInOut(inputs, outputs, 2, 1); err != nil {
 			return nil, err
 		}
-		return newHashJoiner(flowCtx, processorID, core.HashJoiner, inputs[0], inputs[1], post, outputs[0])
+		return newHashJoiner(
+			flowCtx, processorID, core.HashJoiner, inputs[0], inputs[1], post,
+			outputs[0], false, /* disableTempStorage */
+		)
 	}
 	if core.Backfiller != nil {
 		if err := checkNumInOut(inputs, outputs, 0, 1); err != nil {
@@ -209,7 +212,7 @@ func NewProcessor(
 		case execinfrapb.BackfillerSpec_Index:
 			return newIndexBackfiller(flowCtx, processorID, *core.Backfiller, post, outputs[0])
 		case execinfrapb.BackfillerSpec_Column:
-			return newColumnBackfiller(flowCtx, processorID, *core.Backfiller, post, outputs[0])
+			return newColumnBackfiller(ctx, flowCtx, processorID, *core.Backfiller, post, outputs[0])
 		}
 	}
 	if core.Sampler != nil {
@@ -312,6 +315,12 @@ func NewProcessor(
 			return nil, errors.New("ChangeFrontier processor unimplemented")
 		}
 		return NewChangeFrontierProcessor(flowCtx, processorID, *core.ChangeFrontier, inputs[0], outputs[0])
+	}
+	if core.InvertedFilterer != nil {
+		if err := checkNumInOut(inputs, outputs, 1, 1); err != nil {
+			return nil, err
+		}
+		return newInvertedFilterer(flowCtx, processorID, core.InvertedFilterer, inputs[0], post, outputs[0])
 	}
 	return nil, errors.Errorf("unsupported processor core %q", core)
 }

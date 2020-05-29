@@ -32,9 +32,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/txnwait"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
@@ -53,8 +53,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -123,7 +123,7 @@ func TestStoreRangeMergeTwoEmptyRanges(t *testing.T) {
 
 	// The LHS has been split once and merged once, so it should have received
 	// two generation bumps.
-	if e, a := int64(2), lhsRepl.Desc().GetGeneration(); e != a {
+	if e, a := int64(2), lhsRepl.Desc().Generation; e != a {
 		t.Fatalf("expected LHS to have generation %d, but got %d", e, a)
 	}
 }
@@ -234,6 +234,7 @@ func mergeWithData(t *testing.T, retries int64) {
 	storeCfg := kvserver.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableReplicateQueue = true
 	storeCfg.TestingKnobs.DisableMergeQueue = true
+	storeCfg.Clock = nil // manual clock
 
 	// Maybe inject some retryable errors when the merge transaction commits.
 	var mtc *multiTestContext
@@ -438,7 +439,7 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 			if err != nil {
 				return err
 			}
-			if !rhsRepl.OwnsValidLease(mtc.clock.Now()) {
+			if !rhsRepl.OwnsValidLease(mtc.clock().Now()) {
 				return errors.New("rhs store does not own valid lease for rhs range")
 			}
 			return nil
@@ -453,7 +454,7 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 		t.Fatal(pErr)
 	}
 
-	readTS := mtc.clock.Now()
+	readTS := mtc.clock().Now()
 
 	// Simulate a read on the RHS from a node with a newer clock.
 	var ba roachpb.BatchRequest
@@ -476,7 +477,7 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 	pushee := roachpb.MakeTransaction("pushee", rhsKey, roachpb.MinUserPriority, readTS, 0)
 	pusher := roachpb.MakeTransaction("pusher", rhsKey, roachpb.MaxUserPriority, readTS, 0)
 	ba = roachpb.BatchRequest{}
-	ba.Timestamp = mtc.clock.Now()
+	ba.Timestamp = mtc.clock().Now()
 	ba.RangeID = rhsDesc.RangeID
 	ba.Add(pushTxnArgs(&pusher, &pushee, roachpb.PUSH_ABORT))
 	if br, pErr := rhsStore.Send(ctx, ba); pErr != nil {
@@ -509,7 +510,7 @@ func mergeCheckingTimestampCaches(t *testing.T, disjointLeaseholders bool) {
 	// disjoint or not because disjoint leaseholders will lead to a loss of
 	// resolution in the timestamp cache. Either way though, the transaction
 	// should not be allowed to create its record.
-	hb, hbH := heartbeatArgs(&pushee, mtc.clock.Now())
+	hb, hbH := heartbeatArgs(&pushee, mtc.clock().Now())
 	ba = roachpb.BatchRequest{}
 	ba.Header = hbH
 	ba.RangeID = lhsDesc.RangeID
@@ -570,6 +571,7 @@ func TestStoreRangeMergeTimestampCacheCausality(t *testing.T) {
 	ctx := context.Background()
 	storeCfg := kvserver.TestStoreConfig(nil /* clock */)
 	storeCfg.TestingKnobs.DisableMergeQueue = true
+	storeCfg.Clock = nil // manual clock
 	mtc := &multiTestContext{storeConfig: &storeCfg}
 	var readTS hlc.Timestamp
 	rhsKey := roachpb.Key("c")
@@ -794,7 +796,7 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 				},
 			},
 		})
-		defer s.Stopper().Stop(context.TODO())
+		defer s.Stopper().Stop(context.Background())
 
 		leftKey := roachpb.Key("z")
 		rightKey := leftKey.Next().Next()
@@ -808,14 +810,14 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 		assert.NoError(t, err)
 		leftRepl := store.LookupReplica(keys.MustAddr(leftKey))
 		assert.NotNil(t, leftRepl)
-		preSplitGen := leftRepl.Desc().GetGeneration()
+		preSplitGen := leftRepl.Desc().Generation
 		leftDesc, rightDesc, err := s.SplitRange(rightKey)
 		assert.NoError(t, err)
 
 		// Split should increment the LHS' generation and also propagate the result
 		// to the RHS.
-		assert.Equal(t, preSplitGen+1, leftDesc.GetGeneration())
-		assert.Equal(t, preSplitGen+1, rightDesc.GetGeneration())
+		assert.Equal(t, preSplitGen+1, leftDesc.Generation)
+		assert.Equal(t, preSplitGen+1, rightDesc.Generation)
 
 		if rhsHasHigherGen {
 			// Split the RHS again to increment its generation once more, so that
@@ -825,7 +827,7 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 			//
 			rightDesc, _, err = s.SplitRange(rightKey.Next())
 			assert.NoError(t, err)
-			assert.Equal(t, preSplitGen+2, rightDesc.GetGeneration())
+			assert.Equal(t, preSplitGen+2, rightDesc.Generation)
 		} else {
 			// Split and merge the LHS to increment the generation (it ends up
 			// being incremented by two). Note that leftKey.Next() is still in
@@ -835,12 +837,12 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 			// |--left@4---||---right@2---|
 			var tmpRightDesc roachpb.RangeDescriptor
 			leftDesc, tmpRightDesc, err = s.SplitRange(leftKey.Next())
-			assert.Equal(t, preSplitGen+2, leftDesc.GetGeneration())
-			assert.Equal(t, preSplitGen+2, tmpRightDesc.GetGeneration())
+			assert.Equal(t, preSplitGen+2, leftDesc.Generation)
+			assert.Equal(t, preSplitGen+2, tmpRightDesc.Generation)
 			assert.NoError(t, err)
 			leftDesc, err = s.MergeRanges(leftKey)
 			assert.NoError(t, err)
-			assert.Equal(t, preSplitGen+3, leftDesc.GetGeneration())
+			assert.Equal(t, preSplitGen+3, leftDesc.Generation)
 		}
 
 		// Make sure the split/merge shenanigans above didn't get the range
@@ -853,12 +855,12 @@ func TestStoreRangeSplitMergeGeneration(t *testing.T) {
 		mergedDesc, err := s.MergeRanges(leftKey)
 		assert.NoError(t, err)
 
-		maxPreMergeGen := leftDesc.GetGeneration()
-		if rhsGen := rightDesc.GetGeneration(); rhsGen > maxPreMergeGen {
+		maxPreMergeGen := leftDesc.Generation
+		if rhsGen := rightDesc.Generation; rhsGen > maxPreMergeGen {
 			maxPreMergeGen = rhsGen
 		}
 
-		assert.Equal(t, maxPreMergeGen+1, mergedDesc.GetGeneration())
+		assert.Equal(t, maxPreMergeGen+1, mergedDesc.Generation)
 		assert.Equal(t, leftDesc.RangeID, mergedDesc.RangeID)
 	})
 }
@@ -871,6 +873,7 @@ func TestStoreRangeMergeStats(t *testing.T) {
 	ctx := context.Background()
 	storeCfg := kvserver.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableMergeQueue = true
+	storeCfg.Clock = nil // manual clock
 	mtc := &multiTestContext{storeConfig: &storeCfg}
 	mtc.Start(t, 1)
 	defer mtc.Stop()
@@ -1324,6 +1327,7 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 	storeCfg := kvserver.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableReplicateQueue = true
 	storeCfg.TestingKnobs.DisableMergeQueue = true
+	storeCfg.Clock = nil // manual clock
 
 	// The synchronization in this test is tricky. The merge transaction is
 	// controlled by the AdminMerge function and normally commits quite quickly,
@@ -1410,7 +1414,7 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 	// the transaction being inadvertently aborted during its first attempt,
 	// which this test is not designed to handle. If the merge transaction did
 	// abort then the get requests could complete on r2 before the merge retried.
-	hb, hbH := heartbeatArgs(mergeTxn, mtc.clock.Now())
+	hb, hbH := heartbeatArgs(mergeTxn, mtc.clock().Now())
 	if _, pErr := kv.SendWrappedWith(ctx, mtc.stores[0].TestSender(), hbH, hb); pErr != nil {
 		t.Fatal(pErr)
 	}
@@ -1422,9 +1426,7 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 
 	// Manually heartbeat the liveness on the first store to ensure it's
 	// considered live. The automatic heartbeat might not come for a while.
-	if err := mtc.heartbeatLiveness(ctx, 0); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, mtc.heartbeatLiveness(ctx, 0))
 
 	// Send several get and put requests to the the RHS. The first of these to
 	// arrive will acquire the lease; the remaining requests will wait for that
@@ -1444,9 +1446,17 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 	//
 	// This race has since been fixed by installing the mergeComplete channel
 	// before the new lease.
-	reqErrs := make(chan error)
+	reqErrs := make(chan *roachpb.Error) // closed when all reqs done
+	var wg sync.WaitGroup
+	wg.Add(reqConcurrency)
+	go func() {
+		wg.Wait()
+		close(reqErrs)
+	}()
+
 	for i := 0; i < reqConcurrency; i++ {
 		go func(i int) {
+			defer wg.Done()
 			// For this test to have a shot at triggering a race, this log message
 			// must be interleaved with the "new range lease" message, like so:
 			//
@@ -1467,7 +1477,7 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 			_, pErr := kv.SendWrappedWith(ctx, mtc.stores[0].TestSender(), roachpb.Header{
 				RangeID: rhsDesc.RangeID,
 			}, req)
-			reqErrs <- pErr.GoError()
+			reqErrs <- pErr
 		}(i)
 		time.Sleep(time.Millisecond)
 	}
@@ -1478,24 +1488,28 @@ func TestStoreRangeMergeRHSLeaseExpiration(t *testing.T) {
 	// merge to complete without depending too heavily on implementation
 	// details.
 	for i := 0; i < reqConcurrency; i++ {
-		<-reqAcquiredLatch
+		select {
+		case <-reqAcquiredLatch:
+			// Latch acquired.
+		case pErr := <-reqErrs:
+			// Requests may never make it to the latch acquisition if s1 has not
+			// yet learned s2's lease is expired. Instead, we'll see a
+			// NotLeaseholderError.
+			require.IsType(t, &roachpb.NotLeaseHolderError{}, pErr.GetDetail())
+		}
 	}
 	time.Sleep(50 * time.Millisecond)
 
 	// Finally, allow the merge to complete. It should complete successfully.
 	close(finishMerge)
-	if err := <-mergeErr; err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, <-mergeErr)
 
 	// Because the merge completed successfully, r2 has ceased to exist. We
-	// therefore *must* see either a RangeNotFound or a NotLeaseHolderError
-	// error from every pending get and put request. Anything else is a
-	// consistency error (or a bug in the test).
-	for i := 0; i < reqConcurrency; i++ {
-		if err := <-reqErrs; !testutils.IsError(err, "(r2 was not found|not lease holder)") {
-			t.Fatalf("expected error from req during merge, but got %v", err)
-		}
+	// therefore *must* see only RangeNotFoundErrors here from every pending get
+	// and put request. Anything else is a consistency error (or a bug in the
+	// test).
+	for pErr := range reqErrs {
+		require.IsType(t, &roachpb.RangeNotFoundError{}, pErr.GetDetail())
 	}
 }
 
@@ -1509,10 +1523,11 @@ func TestStoreRangeMergeConcurrentRequests(t *testing.T) {
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	storeCfg.TestingKnobs.DisableMergeQueue = true
 	storeCfg.TestingKnobs.DisableReplicateQueue = true
+	storeCfg.Clock = nil // manual clock
 
 	var mtc *multiTestContext
 	storeCfg.TestingKnobs.TestingResponseFilter = func(
-		ba roachpb.BatchRequest, _ *roachpb.BatchResponse,
+		ctx context.Context, ba roachpb.BatchRequest, _ *roachpb.BatchResponse,
 	) *roachpb.Error {
 		del := ba.Requests[0].GetDelete()
 		if del != nil && bytes.HasSuffix(del.Key, keys.LocalRangeDescriptorSuffix) && rand.Int()%4 == 0 {
@@ -1984,7 +1999,7 @@ func TestStoreRangeMergeSlowUnabandonedFollower_WithSplit(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if !rhsRepl.OwnsValidLease(mtc.clock.Now()) {
+		if !rhsRepl.OwnsValidLease(mtc.clock().Now()) {
 			return errors.New("rhs store does not own valid lease for rhs range")
 		}
 		return nil
@@ -2204,7 +2219,7 @@ func TestStoreRangeMergeAbandonedFollowersAutomaticallyGarbageCollected(t *testi
 		if err != nil {
 			return err
 		}
-		if !rhsRepl.OwnsValidLease(mtc.clock.Now()) {
+		if !rhsRepl.OwnsValidLease(mtc.clock().Now()) {
 			return errors.New("store2 does not own valid lease for rhs range")
 		}
 		return nil
@@ -2762,7 +2777,9 @@ func TestStoreRangeMergeSlowWatcher(t *testing.T) {
 	// This verifies that we're actually testing what we claim to.
 	var sawMeta2Req int64
 	meta2CKey := keys.RangeMetaKey(cKey).AsRawKey()
-	storeCfg.TestingKnobs.TestingResponseFilter = func(ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
+	storeCfg.TestingKnobs.TestingResponseFilter = func(
+		ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse,
+	) *roachpb.Error {
 		for i, req := range ba.Requests {
 			if g := req.GetGet(); g != nil && g.Key.Equal(meta2CKey) && br.Responses[i].GetGet().Value == nil {
 				atomic.StoreInt64(&sawMeta2Req, 1)
@@ -2851,37 +2868,16 @@ func TestStoreRangeMergeSlowWatcher(t *testing.T) {
 	}
 }
 
-// TestStoreRangeMergeRaftSnapshot sets up a situation which triggers a
-// snapshot that spans both a range merge and split and verifies that the
-// contents of the SSTs that are created for ingestion as a result of the
-// snapshot are what we expect them to be.
-//
-// The test first creates three ranges: [a, b), [b, c), [c, e) and [e, /Max).
-// Keys are inserted at a, b, c and d0 through d9. It then drops traffic to the
-// [a, b) replica on store2 after which the above ranges are iteratively merged
-// together to form [a, e), [e, /Max) then finally split to form
-// [a, d), [d, e), [e, /Max). Once this is all done, the Raft log is truncated
-// to ensure that the replica cannot be caught up with incremental diffs.
-//
-// This set-up allows us to verify that the receiving replica:
-// 1. Creates an SSTs for the user keys in the snapshot with a range del
-// tombstone that is only as wide as the keys that are present in the range.
-// 2. This SST contain all of the user keys that we've inserted.
-// 3. Creates SSTs which correctly clear keys contained in subsumed replicas
-// again with tombstones that are constrained to the keys present in the
-// range.
 func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	// We will be testing the SSTs written on store2's engine.
-	var receivingEng storage.Engine
-	// Used to set the MVCCKey.Timestamp of the manually inserted keys so we
-	// can create keys that are byte-by-byte equal to the ones in the snapshot.
-	keyTimestamps := make(map[string]hlc.Timestamp)
+	var receivingEng, sendingEng storage.Engine
 	ctx := context.Background()
 	storeCfg := kvserver.TestStoreConfig(nil)
 	storeCfg.TestingKnobs.DisableReplicateQueue = true
 	storeCfg.TestingKnobs.DisableReplicaGCQueue = true
+	storeCfg.Clock = nil // manual clock
 	storeCfg.TestingKnobs.BeforeSnapshotSSTIngestion = func(
 		inSnap kvserver.IncomingSnapshot,
 		snapType kvserver.SnapshotRequest_Type,
@@ -2927,48 +2923,41 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		// tombstones and range deletion tombstones.
 		var expectedSSTs [][]byte
 
-		// Construct SST #3 as numbered above. We set-up the scenario that
-		// triggered the snapshot so we should be able to predict exactly what
-		// should be in the SST.
-		{
+		// Construct SST #1 through #3 as numbered above, but only ultimately
+		// keep the 3rd one.
+		keyRanges := rditer.MakeReplicatedKeyRanges(inSnap.State.Desc)
+		it := rditer.NewReplicaDataIterator(inSnap.State.Desc, sendingEng, true /* replicatedOnly */, false /* seekEnd */)
+		defer it.Close()
+		// Write a range deletion tombstone to each of the SSTs then put in the
+		// kv entries from the sender of the snapshot.
+		for _, r := range keyRanges {
 			sstFile := &storage.MemFile{}
 			sst := storage.MakeIngestionSSTWriter(sstFile)
-			// Expect the user KeyRange to be [a, d) but we only have keys at
-			// a, b and c so we expect rditer.ConstrainToKeys to restrict the
-			// width of the range del tombstone to [a, c).
-			if err := sst.ClearRange(
-				storage.MakeMVCCMetadataKey(roachpb.Key("a")),
-				storage.MakeMVCCMetadataKey(roachpb.Key("c").Next()),
-			); err != nil {
+			if err := sst.ClearRange(r.Start, r.End); err != nil {
 				return err
 			}
 
-			// Insert keys "a", "b" and "c" with a timestamp that matches the
-			// sender's and has a value of 1.
-			createValFunc := func(key string, val int64) (storage.MVCCKey, roachpb.Value) {
-				k := roachpb.Key(key)
-				mvccKey := storage.MVCCKey{Key: k, Timestamp: keyTimestamps[string(k)]}
-				var v roachpb.Value
-				v.SetInt(val)
-				v.InitChecksum(k)
-				return mvccKey, v
+			// Keep adding kv data to the SST until the the key exceeds the
+			// bounds of the range, then proceed to the next range.
+			for ; ; it.Next() {
+				valid, err := it.Valid()
+				if err != nil {
+					return err
+				}
+				if !valid || r.End.Key.Compare(it.Key().Key) <= 0 {
+					if err := sst.Finish(); err != nil {
+						return err
+					}
+					sst.Close()
+					expectedSSTs = append(expectedSSTs, sstFile.Data())
+					break
+				}
+				if err := sst.Put(it.Key(), it.Value()); err != nil {
+					return err
+				}
 			}
-			k1, v1 := createValFunc("a", int64(1))
-			k2, v2 := createValFunc("b", int64(1))
-			k3, v3 := createValFunc("c", int64(1))
-			if err := sst.Put(k1, v1.RawBytes); err != nil {
-				return err
-			}
-			if err := sst.Put(k2, v2.RawBytes); err != nil {
-				return err
-			}
-			if err := sst.Put(k3, v3.RawBytes); err != nil {
-				return err
-			}
-
-			sst.Close()
-			expectedSSTs = append(expectedSSTs, sstFile.Data())
 		}
+		expectedSSTs = expectedSSTs[2:]
 
 		// Construct SSTs #5 and #6: range-id local keys of subsumed replicas
 		// with RangeIDs 3 and 4.
@@ -2982,7 +2971,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			}
 			tombstoneKey := keys.RangeTombstoneKey(rangeID)
 			tombstoneValue := &roachpb.RangeTombstone{NextReplicaID: math.MaxInt32}
-			if err := storage.MVCCBlindPutProto(context.TODO(), &sst, nil, tombstoneKey, hlc.Timestamp{}, tombstoneValue, nil); err != nil {
+			if err := storage.MVCCBlindPutProto(context.Background(), &sst, nil, tombstoneKey, hlc.Timestamp{}, tombstoneValue, nil); err != nil {
 				return err
 			}
 			err := sst.Finish()
@@ -2996,12 +2985,16 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		sstFile := &storage.MemFile{}
 		sst := storage.MakeIngestionSSTWriter(sstFile)
 		defer sst.Close()
-		// Expect there to be keys d0 through d9 in the [a, d) user KeyRange
-		// so the range del tombstone should only span exactly these keys.
-		if err := storage.ClearRangeWithHeuristic(receivingEng, &sst, roachpb.Key("d0"), roachpb.Key("d9").Next()); err != nil {
+		desc := roachpb.RangeDescriptor{
+			StartKey: roachpb.RKey("d"),
+			EndKey:   roachpb.RKeyMax,
+		}
+		r := rditer.MakeUserKeyRange(&desc)
+		if err := storage.ClearRangeWithHeuristic(receivingEng, &sst, r.Start.Key, r.End.Key); err != nil {
 			return err
 		}
-		if err := sst.Finish(); err != nil {
+		err := sst.Finish()
+		if err != nil {
 			return err
 		}
 		expectedSSTs = append(expectedSSTs, sstFile.Data())
@@ -3018,7 +3011,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			}
 		}
 		if len(mismatchedSstsIdx) != 0 {
-			return errors.Errorf("actual and expected SST indices %v don't match", mismatchedSstsIdx)
+			return errors.Errorf("SST indices %v don't match", mismatchedSstsIdx)
 		}
 		return nil
 	}
@@ -3032,6 +3025,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 	mtc.Start(t, 3)
 	defer mtc.Stop()
 	store0, store2 := mtc.Store(0), mtc.Store(2)
+	sendingEng = store0.Engine()
 	receivingEng = store2.Engine()
 	distSender := mtc.distSenders[0]
 
@@ -3041,15 +3035,9 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 		if _, pErr := kv.SendWrapped(ctx, distSender, adminSplitArgs(key)); pErr != nil {
 			t.Fatal(pErr)
 		}
-		// Manually send the request so we can store the timestamp.
-		ba := roachpb.BatchRequest{}
-		ba.Add(incrementArgs(key, 1))
-		br, pErr := distSender.Send(ctx, ba)
-		if pErr != nil {
+		if _, pErr := kv.SendWrapped(ctx, distSender, incrementArgs(key, 1)); pErr != nil {
 			t.Fatal(pErr)
 		}
-		keyTimestamps[string(key)] = br.Timestamp
-
 		mtc.waitForValues(key, []int64{1, 1, 1})
 	}
 
@@ -3063,13 +3051,6 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			t.Fatal(pErr)
 		}
 		mtc.waitForValues(key, []int64{1, 1, 1})
-	}
-
-	// Split [d, /Max) into [d, e) and [e, /Max) so we can predict the
-	// contents of [a, d) without having to worry about metadata keys that will
-	// now be in [e, /Max) instead.
-	if _, pErr := kv.SendWrapped(ctx, distSender, adminSplitArgs(roachpb.Key("e"))); pErr != nil {
-		t.Fatal(pErr)
 	}
 
 	aRepl0 := store0.LookupReplica(roachpb.RKey("a"))
@@ -3190,6 +3171,7 @@ func TestStoreRangeMergeDuringShutdown(t *testing.T) {
 	storeCfg.TestingKnobs.DisableSplitQueue = true
 	storeCfg.TestingKnobs.DisableMergeQueue = true
 	storeCfg.TestingKnobs.DisableReplicateQueue = true
+	storeCfg.Clock = nil // manual clock
 
 	// Install a filter that triggers a shutdown when stop is non-zero and the
 	// rhsDesc requests a new lease.
@@ -3199,7 +3181,7 @@ func TestStoreRangeMergeDuringShutdown(t *testing.T) {
 		rhsDesc        *roachpb.RangeDescriptor
 		stop, stopping bool
 	}
-	storeCfg.TestingKnobs.TestingPostApplyFilter = func(args storagebase.ApplyFilterArgs) (int, *roachpb.Error) {
+	storeCfg.TestingKnobs.TestingPostApplyFilter = func(args kvserverbase.ApplyFilterArgs) (int, *roachpb.Error) {
 		state.Lock()
 		if state.stop && !state.stopping && args.RangeID == state.rhsDesc.RangeID && args.IsLeaseRequest {
 			// Shut down the store. The lease acquisition will notice that a merge is
@@ -3282,7 +3264,7 @@ func TestMergeQueue(t *testing.T) {
 	rangeMinBytes := int64(1 << 10) // 1KB
 	storeCfg.DefaultZoneConfig.RangeMinBytes = &rangeMinBytes
 	sv := &storeCfg.Settings.SV
-	storagebase.MergeQueueEnabled.Override(sv, true)
+	kvserverbase.MergeQueueEnabled.Override(sv, true)
 	kvserver.MergeQueueInterval.Override(sv, 0) // process greedily
 	var mtc multiTestContext
 	// This test was written before the multiTestContext started creating many
@@ -3291,7 +3273,7 @@ func TestMergeQueue(t *testing.T) {
 
 	mtc.storeConfig = &storeCfg
 	// Inject clock for manipulation in tests.
-	mtc.clock = clock
+	mtc.storeConfig.Clock = clock
 	mtc.Start(t, 2)
 	defer mtc.Stop()
 	mtc.initGossipNetwork() // needed for the non-collocated case's rebalancing to work

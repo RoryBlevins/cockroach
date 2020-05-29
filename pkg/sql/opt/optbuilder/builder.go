@@ -59,12 +59,6 @@ type Builder struct {
 	// These fields can be set before calling Build to control various aspects of
 	// the building process.
 
-	// AllowUnsupportedExpr is a control knob: if set, when building a scalar, the
-	// builder takes any TypedExpr node that it doesn't recognize and wraps that
-	// expression in an UnsupportedExpr node. This is temporary; it is used for
-	// interfacing with the old planning code.
-	AllowUnsupportedExpr bool
-
 	// KeepPlaceholders is a control knob: if set, optbuilder will never replace
 	// a placeholder operator with its assigned value, even when it is available.
 	// This is used when re-preparing invalidated queries.
@@ -303,6 +297,10 @@ func (b *Builder) buildStmt(
 	case *tree.Export:
 		return b.buildExport(stmt, inScope)
 
+	case *tree.ExplainAnalyzeDebug:
+		// This statement should have been handled by the executor.
+		panic(errors.Errorf("%s can only be used as a top-level statement", stmt.StatementTag()))
+
 	default:
 		// See if this statement can be rewritten to another statement using the
 		// delegate functionality.
@@ -325,7 +323,7 @@ func (b *Builder) buildStmt(
 			b.DisableMemoReuse = true
 			return outScope
 		}
-		panic(unimplementedWithIssueDetailf(34848, stmt.StatementTag(), "unsupported statement: %T", stmt))
+		panic(errors.AssertionFailedf("unexpected statement: %T", stmt))
 	}
 }
 

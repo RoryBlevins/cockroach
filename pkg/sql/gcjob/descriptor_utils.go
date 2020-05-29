@@ -14,6 +14,7 @@ import (
 	"context"
 
 	"github.com/cockroachdb/cockroach/pkg/config"
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
@@ -53,20 +54,22 @@ func updateDescriptorGCMutations(
 }
 
 // dropTableDesc removes a descriptor from the KV database.
-func dropTableDesc(ctx context.Context, db *kv.DB, tableDesc *sqlbase.TableDescriptor) error {
+func dropTableDesc(
+	ctx context.Context, db *kv.DB, codec keys.SQLCodec, tableDesc *sqlbase.TableDescriptor,
+) error {
 	log.Infof(ctx, "removing table descriptor for table %d", tableDesc.ID)
-	descKey := sqlbase.MakeDescMetadataKey(tableDesc.ID)
+	descKey := sqlbase.MakeDescMetadataKey(codec, tableDesc.ID)
 	zoneKeyPrefix := config.MakeZoneKeyPrefix(uint32(tableDesc.ID))
 
 	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 		b := &kv.Batch{}
 		// Delete the descriptor.
 		b.Del(descKey)
 		// Delete the zone config entry for this table.
 		b.DelRange(zoneKeyPrefix, zoneKeyPrefix.PrefixEnd(), false /* returnKeys */)
-		if err := txn.SetSystemConfigTrigger(); err != nil {
-			return err
-		}
 
 		return txn.Run(ctx, b)
 	})
@@ -76,6 +79,9 @@ func dropTableDesc(ctx context.Context, db *kv.DB, tableDesc *sqlbase.TableDescr
 func deleteDatabaseZoneConfig(ctx context.Context, db *kv.DB, databaseID sqlbase.ID) error {
 	return db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		b := &kv.Batch{}
+		if err := txn.SetSystemConfigTrigger(); err != nil {
+			return err
+		}
 
 		// Delete the zone config entry for the dropped database associated with the
 		// job, if it exists.

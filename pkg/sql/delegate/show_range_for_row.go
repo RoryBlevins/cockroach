@@ -33,6 +33,9 @@ func (d *delegator) delegateShowRangeForRow(n *tree.ShowRangeForRow) (tree.State
 	if err := d.catalog.CheckPrivilege(d.ctx, idx.Table(), privilege.SELECT); err != nil {
 		return nil, err
 	}
+	if idx.Table().IsVirtualTable() {
+		return nil, errors.New("SHOW RANGE FOR ROW may not be called on a virtual table")
+	}
 	span := idx.Span()
 	table := idx.Table()
 
@@ -45,7 +48,7 @@ func (d *delegator) delegateShowRangeForRow(n *tree.ShowRangeForRow) (tree.State
 	var rowExprs tree.Exprs
 	for i, expr := range n.Row {
 		colTyp := table.Column(i).DatumType()
-		typedExpr, err := sqlbase.SanitizeVarFreeExpr(expr, colTyp, "range-for-row", &semaCtx, false)
+		typedExpr, err := sqlbase.SanitizeVarFreeExpr(d.ctx, expr, colTyp, "range-for-row", &semaCtx, false)
 		if err != nil {
 			return nil, err
 		}

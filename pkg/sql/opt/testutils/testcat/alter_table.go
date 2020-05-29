@@ -11,6 +11,7 @@
 package testcat
 
 import (
+	"context"
 	gojson "encoding/json"
 	"fmt"
 	"sort"
@@ -25,6 +26,7 @@ import (
 //
 // Supported commands:
 //  - INJECT STATISTICS: imports table statistics from a JSON object.
+//  - ADD CONSTRAINT FOREIGN KEY: add a foreign key reference.
 //
 func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 	tn := stmt.Table.ToTableName()
@@ -37,6 +39,15 @@ func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 		case *tree.AlterTableInjectStats:
 			injectTableStats(tab, t.Stats)
 
+		case *tree.AlterTableAddConstraint:
+			switch d := t.ConstraintDef.(type) {
+			case *tree.ForeignKeyConstraintTableDef:
+				tc.resolveFK(tab, d)
+
+			default:
+				panic(fmt.Sprintf("unsupported constraint type %v", d))
+			}
+
 		default:
 			panic(fmt.Sprintf("unsupported ALTER TABLE command %T", t))
 		}
@@ -45,10 +56,11 @@ func (tc *Catalog) AlterTable(stmt *tree.AlterTable) {
 
 // injectTableStats sets the table statistics as specified by a JSON object.
 func injectTableStats(tt *Table, statsExpr tree.Expr) {
+	ctx := context.Background()
 	semaCtx := tree.MakeSemaContext()
 	evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
 	typedExpr, err := tree.TypeCheckAndRequire(
-		statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS",
+		ctx, statsExpr, &semaCtx, types.Jsonb, "INJECT STATISTICS",
 	)
 	if err != nil {
 		panic(err)

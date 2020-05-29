@@ -21,7 +21,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/stats"
@@ -50,6 +53,12 @@ func (p *planner) SetClusterSetting(
 		return nil, err
 	}
 
+	if !p.execCfg.TenantTestingKnobs.CanSetClusterSettings() && !p.execCfg.Codec.ForSystemTenant() {
+		// Setting cluster settings is disabled for phase 2 tenants if a test does
+		// not explicitly allow for setting in-memory cluster settings.
+		return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can SET CLUSTER SETTING")
+	}
+
 	name := strings.ToLower(n.Name)
 	st := p.EvalContext().Settings
 	v, ok := settings.Lookup(name, settings.LookupForLocalAccess)
@@ -60,6 +69,12 @@ func (p *planner) SetClusterSetting(
 	setting, ok := v.(settings.WritableSetting)
 	if !ok {
 		return nil, errors.AssertionFailedf("expected writable setting, got %T", v)
+	}
+
+	if _, ok := setting.(*settings.StateMachineSetting); ok && p.execCfg.TenantTestingKnobs.CanSetClusterSettings() {
+		// A tenant that is allowed to set in-memory cluster settings is attempting
+		// to set a state machine setting, which is disallowed due to complexity.
+		return nil, pgerror.Newf(pgcode.InsufficientPrivilege, "only the system tenant can set state machine settings")
 	}
 
 	var value tree.TypedExpr
@@ -106,6 +121,30 @@ func (p *planner) SetClusterSetting(
 func (n *setClusterSettingNode) startExec(params runParams) error {
 	if !params.p.ExtendedEvalContext().TxnImplicit {
 		return errors.Errorf("SET CLUSTER SETTING cannot be used inside a transaction")
+	}
+
+	if !params.p.execCfg.Codec.ForSystemTenant() {
+		// Sanity check that this tenant is able to set in-memory settings.
+		if !params.p.execCfg.TenantTestingKnobs.CanSetClusterSettings() {
+			return errors.Errorf("tenants cannot set cluster settings, this permission should have been checked at plan time")
+		}
+		var encodedValue string
+		if n.value == nil {
+			encodedValue = n.setting.EncodedDefault()
+		} else {
+			value, err := n.value.Eval(params.p.EvalContext())
+			if err != nil {
+				return err
+			}
+			if _, ok := n.setting.(*settings.StateMachineSetting); ok {
+				return errors.Errorf("tenants cannot change state machine settings, this should've been checked at plan time")
+			}
+			encodedValue, err = toSettingString(params.ctx, n.st, n.name, n.setting, value, nil /* prev */)
+			if err != nil {
+				return err
+			}
+		}
+		return params.p.execCfg.TenantTestingKnobs.ClusterSettingsUpdater.Set(n.name, encodedValue, n.setting.Typ())
 	}
 
 	execCfg := params.extendedEvalCtx.ExecCfg
@@ -172,12 +211,36 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			case "false":
 				telemetry.Inc(sqltelemetry.TurnAutoStatsOffUseCounter)
 			}
+		case ConnAuditingClusterSettingName:
+			switch expectedEncodedValue {
+			case "true":
+				telemetry.Inc(sqltelemetry.TurnConnAuditingOnUseCounter)
+			case "false":
+				telemetry.Inc(sqltelemetry.TurnConnAuditingOffUseCounter)
+			}
+		case AuthAuditingClusterSettingName:
+			switch expectedEncodedValue {
+			case "true":
+				telemetry.Inc(sqltelemetry.TurnAuthAuditingOnUseCounter)
+			case "false":
+				telemetry.Inc(sqltelemetry.TurnAuthAuditingOffUseCounter)
+			}
 		case ReorderJoinsLimitClusterSettingName:
 			val, err := strconv.ParseInt(expectedEncodedValue, 10, 64)
 			if err != nil {
 				break
 			}
 			sqltelemetry.ReportJoinReorderLimit(int(val))
+		case VectorizeClusterSettingName:
+			val, err := strconv.Atoi(expectedEncodedValue)
+			if err != nil {
+				break
+			}
+			validatedExecMode, isValid := sessiondata.VectorizeExecModeFromString(sessiondata.VectorizeExecMode(val).String())
+			if !isValid {
+				break
+			}
+			telemetry.Inc(sqltelemetry.VecModeCounter(validatedExecMode.String()))
 		}
 
 		return MakeEventLogger(params.extendedEvalCtx.ExecCfg).InsertEventRecord(
@@ -185,7 +248,7 @@ func (n *setClusterSettingNode) startExec(params runParams) error {
 			txn,
 			EventLogSetClusterSetting,
 			0, /* no target */
-			int32(params.extendedEvalCtx.NodeID),
+			int32(params.extendedEvalCtx.NodeID.SQLInstanceID()),
 			EventLogSetClusterSettingDetail{n.name, reportedValue, params.SessionData().User},
 		)
 	}); err != nil {
@@ -279,14 +342,14 @@ func toSettingString(
 			if ok {
 				return settings.EncodeInt(v), nil
 			}
-			return "", errors.Errorf("invalid integer value '%d' for enum setting", *i)
+			return "", errors.WithHintf(errors.Errorf("invalid integer value '%d' for enum setting", *i), setting.GetAvailableValuesAsHint())
 		} else if s, ok := d.(*tree.DString); ok {
 			str := string(*s)
 			v, ok := setting.ParseEnum(str)
 			if ok {
 				return settings.EncodeInt(v), nil
 			}
-			return "", errors.Errorf("invalid string value '%s' for enum setting", str)
+			return "", errors.WithHintf(errors.Errorf("invalid string value '%s' for enum setting", str), setting.GetAvailableValuesAsHint())
 		}
 		return "", errors.Errorf("cannot use %s %T value for enum setting, must be int or string", d.ResolvedType(), d)
 	case *settings.ByteSizeSetting:

@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
@@ -23,10 +24,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
+	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -80,6 +82,7 @@ func TestReplicaRangefeed(t *testing.T) {
 
 	ctx := context.Background()
 	sc := kvserver.TestStoreConfig(nil)
+	sc.Clock = nil // manual clock
 	kvserver.RangefeedEnabled.Override(&sc.Settings.SV, true)
 	mtc := &multiTestContext{
 		storeConfig: &sc,
@@ -102,9 +105,9 @@ func TestReplicaRangefeed(t *testing.T) {
 	rangeID := mtc.Store(0).LookupReplica(startKey).RangeID
 
 	// Insert a key before starting the rangefeeds.
-	initTime := mtc.clock.Now()
+	initTime := mtc.clock().Now()
 	mtc.manualClock.Increment(1)
-	ts1 := mtc.clock.Now()
+	ts1 := mtc.clock().Now()
 	incArgs := incrementArgs(roachpb.Key("b"), 9)
 	_, pErr := kv.SendWrappedWith(ctx, db, roachpb.Header{Timestamp: ts1}, incArgs)
 	if pErr != nil {
@@ -177,7 +180,7 @@ func TestReplicaRangefeed(t *testing.T) {
 
 	// Insert a key non-transactionally.
 	mtc.manualClock.Increment(1)
-	ts2 := mtc.clock.Now()
+	ts2 := mtc.clock().Now()
 	pArgs := putArgs(roachpb.Key("c"), []byte("val2"))
 	_, pErr = kv.SendWrappedWith(ctx, db, roachpb.Header{Timestamp: ts2}, pArgs)
 	if pErr != nil {
@@ -186,7 +189,7 @@ func TestReplicaRangefeed(t *testing.T) {
 
 	// Insert a second key transactionally.
 	mtc.manualClock.Increment(1)
-	ts3 := mtc.clock.Now()
+	ts3 := mtc.clock().Now()
 	if err := mtc.dbs[1].Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		txn.SetFixedTimestamp(ctx, ts3)
 		return txn.Put(ctx, roachpb.Key("m"), []byte("val3"))
@@ -200,7 +203,7 @@ func TestReplicaRangefeed(t *testing.T) {
 
 	// Update the originally incremented key non-transactionally.
 	mtc.manualClock.Increment(1)
-	ts4 := mtc.clock.Now()
+	ts4 := mtc.clock().Now()
 	_, pErr = kv.SendWrappedWith(ctx, db, roachpb.Header{Timestamp: ts4}, incArgs)
 	if pErr != nil {
 		t.Fatal(pErr)
@@ -208,7 +211,7 @@ func TestReplicaRangefeed(t *testing.T) {
 
 	// Update the originally incremented key transactionally.
 	mtc.manualClock.Increment(1)
-	ts5 := mtc.clock.Now()
+	ts5 := mtc.clock().Now()
 	if err := mtc.dbs[1].Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		txn.SetFixedTimestamp(ctx, ts5)
 		_, err := txn.Inc(ctx, incArgs.Key, 7)
@@ -309,6 +312,7 @@ func TestReplicaRangefeedExpiringLeaseError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	sc := kvserver.TestStoreConfig(nil)
+	sc.Clock = nil // manual clock
 	kvserver.RangefeedEnabled.Override(&sc.Settings.SV, true)
 	mtc := &multiTestContext{
 		storeConfig: &sc,
@@ -348,6 +352,7 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 	setup := func(subT *testing.T) (*multiTestContext, roachpb.RangeID) {
 		subT.Helper()
 		sc := kvserver.TestStoreConfig(nil)
+		sc.Clock = nil // manual clock
 		kvserver.RangefeedEnabled.Override(&sc.Settings.SV, true)
 		mtc := &multiTestContext{
 			storeConfig: &sc,
@@ -658,17 +663,28 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		assertRangefeedRetryErr(t, pErr, roachpb.RangeFeedRetryError_REASON_RAFT_SNAPSHOT)
 	})
 	t.Run(roachpb.RangeFeedRetryError_REASON_LOGICAL_OPS_MISSING.String(), func(t *testing.T) {
-		mtc, rangeID := setup(t)
+		mtc, _ := setup(t)
 		defer mtc.Stop()
+
+		// Split the range so that the RHS is not a system range and thus will
+		// respect the rangefeed_enabled cluster setting.
+		startKey := keys.UserTableDataMin
+		splitArgs := adminSplitArgs(startKey)
+		if _, pErr := kv.SendWrapped(ctx, mtc.distSenders[0], splitArgs); pErr != nil {
+			t.Fatalf("split saw unexpected error: %v", pErr)
+		}
+		rightRangeID := mtc.Store(0).LookupReplica(roachpb.RKey(startKey)).RangeID
 
 		// Establish a rangefeed.
 		stream := newTestStream()
 		streamErrC := make(chan *roachpb.Error, 1)
-		rangefeedSpan := roachpb.Span{Key: roachpb.Key("a"), EndKey: roachpb.Key("z")}
+
+		endKey := keys.TableDataMax
+		rangefeedSpan := roachpb.Span{Key: startKey, EndKey: endKey}
 		go func() {
 			req := roachpb.RangeFeedRequest{
 				Header: roachpb.Header{
-					RangeID: rangeID,
+					RangeID: rightRangeID,
 				},
 				Span: rangefeedSpan,
 			}
@@ -685,7 +701,8 @@ func TestReplicaRangefeedRetryErrors(t *testing.T) {
 		kvserver.RangefeedEnabled.Override(&mtc.storeConfig.Settings.SV, false)
 
 		// Perform a write on the range.
-		pArgs := putArgs(roachpb.Key("c"), []byte("val2"))
+		writeKey := encoding.EncodeStringAscending(keys.SystemSQLCodec.TablePrefix(55), "c")
+		pArgs := putArgs(writeKey, []byte("val2"))
 		if _, pErr := kv.SendWrapped(ctx, mtc.distSenders[0], pArgs); pErr != nil {
 			t.Fatal(pErr)
 		}

@@ -25,7 +25,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/docgen/extract"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
 )
 
@@ -293,7 +293,7 @@ func runParse(
 		return nil, errors.Wrap(err, "inline")
 	}
 	b, err := g.ExtractProduction(topStmt, descend, nosplit, match, exclude)
-	b = bytes.Replace(b, []byte("IDENT"), []byte("identifier"), -1)
+	b = bytes.Replace(b, []byte("'IDENT'"), []byte("'identifier'"), -1)
 	b = bytes.Replace(b, []byte("_LA"), []byte(""), -1)
 	return b, err
 }
@@ -351,19 +351,9 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "alter_role_stmt",
-		inline: []string{"opt_role_options"},
+		inline: []string{"role_or_group_or_user", "opt_role_options"},
 		replace: map[string]string{
-			"string_or_placeholder":             "name'",
-			"opt_role_options":                  "OPTIONS",
-			"string_or_placeholder  'PASSWORD'": "name 'PASSWORD'",
-			"'PASSWORD' string_or_placeholder":  "'PASSWORD' password"},
-		unlink: []string{"name", "password"},
-	},
-	{
-		name:   "alter_user_stmt",
-		inline: []string{"opt_role_options"},
-		replace: map[string]string{
-			"string_or_placeholder":             "name'",
+			"string_or_placeholder":             "name",
 			"opt_role_options":                  "OPTIONS",
 			"string_or_placeholder  'PASSWORD'": "name 'PASSWORD'",
 			"'PASSWORD' string_or_placeholder":  "'PASSWORD' password"},
@@ -599,16 +589,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "create_role_stmt",
-		inline: []string{"opt_role_options"},
-		replace: map[string]string{
-			"string_or_placeholder":             "name",
-			"opt_role_options":                  "OPTIONS",
-			"string_or_placeholder  'PASSWORD'": "name 'PASSWORD'",
-			"'PASSWORD' string_or_placeholder":  "'PASSWORD' password"},
-	},
-	{
-		name:   "create_user_stmt",
-		inline: []string{"opt_role_options"},
+		inline: []string{"role_or_group_or_user", "opt_role_options"},
 		replace: map[string]string{
 			"string_or_placeholder":             "name",
 			"opt_role_options":                  "OPTIONS",
@@ -686,10 +667,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:    "drop_role_stmt",
-		replace: map[string]string{"string_or_placeholder_list": "name"},
-	},
-	{
-		name:    "drop_user_stmt",
+		inline:  []string{"role_or_group_or_user"},
 		replace: map[string]string{"string_or_placeholder_list": "name"},
 	},
 	{
@@ -1012,8 +990,7 @@ var specs = []stmtSpec{
 		stmt:    "rollback_stmt",
 		inline:  []string{"opt_transaction"},
 		match:   []*regexp.Regexp{regexp.MustCompile("'ROLLBACK'")},
-		replace: map[string]string{"'TRANSACTION'": "", "'TO'": "'TO' 'SAVEPOINT'", "savepoint_name": "cockroach_restart"},
-		unlink:  []string{"cockroach_restart"},
+		replace: map[string]string{"'TRANSACTION'": "", "'TO'": "'TO' 'SAVEPOINT'"},
 	},
 	{
 		name:   "limit_clause",
@@ -1219,6 +1196,9 @@ var specs = []stmtSpec{
 		name: "show_roles_stmt",
 	},
 	{
+		name: "show_users_stmt",
+	},
+	{
 		name: "show_ranges_stmt",
 		stmt: "show_ranges_stmt",
 	},
@@ -1265,9 +1245,9 @@ var specs = []stmtSpec{
 		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'TRANSACTION'")},
 	},
 	{
-		name:  "show_users",
-		stmt:  "show_stmt",
-		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'USERS'")},
+		name:  "show_savepoint_status",
+		stmt:  "show_savepoint_stmt",
+		match: []*regexp.Regexp{regexp.MustCompile("'SHOW' 'SAVEPOINT' 'STATUS'")},
 	},
 	{
 		name:   "show_zone_stmt",

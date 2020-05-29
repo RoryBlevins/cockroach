@@ -133,10 +133,6 @@ func TestIndexConstraints(t *testing.T) {
 					d.Fatalf(t, "%v", err)
 				}
 
-				varNames := make([]string, len(varTypes))
-				for i := range varNames {
-					varNames[i] = fmt.Sprintf("@%d", i+1)
-				}
 				var ic idxconstraint.Instance
 				ic.Init(filters, optionalFilters, indexCols, notNullCols, invertedIndex, &evalCtx, &f)
 				result := ic.Constraint()
@@ -302,7 +298,6 @@ func buildFilters(
 		return memo.FiltersExpr{}, err
 	}
 	b := optbuilder.NewScalar(context.Background(), semaCtx, evalCtx, f)
-	b.AllowUnsupportedExpr = true
 	if err := b.Build(expr); err != nil {
 		return memo.FiltersExpr{}, err
 	}

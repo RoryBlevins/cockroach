@@ -1,6 +1,9 @@
+# This test times out when run with 3node-tenant.
+# LogicTest: !3node-tenant
+
 # The tests in this file target the legacy FK paths.
 statement ok
-SET experimental_optimizer_foreign_keys = false
+SET optimizer_foreign_keys = false
 
 subtest AllCascadingActions
 ### A test of all cascading actions in their most basic form.
@@ -543,6 +546,12 @@ statement ok
 CREATE TABLE c3 (
   id STRING PRIMARY KEY REFERENCES b2 ON DELETE CASCADE
 ) INTERLEAVE IN PARENT b2 (id);
+
+# Check that telemetry is being collected on creation of interleaved tables.
+query B
+SELECT usage_count >= 5 FROM crdb_internal.feature_usage WHERE feature_name = 'sql.schema.create_interleaved_table'
+----
+true
 
 statement ok
 INSERT INTO a VALUES ('pk1'), ('pk2');

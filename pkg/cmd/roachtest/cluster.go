@@ -323,11 +323,24 @@ func (r *clusterRegistry) destroyAllClusters(ctx context.Context, l *logger) {
 	}
 }
 
+// execCmd is like execCmdEx, but doesn't return the command's output.
 func execCmd(ctx context.Context, l *logger, args ...string) error {
-	// NB: It is important that this waitgroup Waits after cancel() below.
-	var wg sync.WaitGroup
-	defer wg.Wait()
+	return execCmdEx(ctx, l, args...).err
+}
 
+type cmdRes struct {
+	err error
+	// stdout and stderr are the commands output. Note that this is truncated and
+	// only a tail is returned.
+	stdout, stderr string
+}
+
+// execCmdEx runs a command and returns its error and output.
+//
+// Note that the output is truncated; only a tail is returned.
+// Also note that if the command exits with an error code, its output is also
+// included in cmdRes.err.
+func execCmdEx(ctx context.Context, l *logger, args ...string) cmdRes {
 	var cancel func()
 	ctx, cancel = context.WithCancel(ctx)
 	defer cancel()
@@ -339,29 +352,75 @@ func execCmd(ctx context.Context, l *logger, args ...string) error {
 	debugStderrBuffer, _ := circbuf.NewBuffer(1024)
 
 	// Do a dance around https://github.com/golang/go/issues/23019.
-	// Briefly put, passing os.Std{out,err} to subprocesses isn't great for
-	// context cancellation as Run() will wait for any subprocesses to finish.
-	// For example, "roachprod run x -- sleep 20" would wait 20 seconds, even
-	// if the context got canceled right away. Work around the problem by passing
-	// pipes to the command on which we set aggressive deadlines once the context
-	// expires.
+	// When the command we run launches a subprocess, that subprocess receives
+	// a copy of our Command's Stdout/Stderr file descriptor, which effectively
+	// means that the file descriptors close only when that subcommand returns.
+	// However, proactively killing the subcommand is not really possible - we
+	// will only manage to kill the parent process that we launched directly.
+	// In practice this means that if we try to react to context cancellation,
+	// the pipes we read the output from will wait for the *subprocess* to
+	// terminate, leaving us hanging, potentially indefinitely.
+	// To work around it, use pipes and set a read deadline on our (read) end of
+	// the pipes when we detect a context cancellation.
+	//
+	// See TestExecCmd for a test.
+	var closePipes func(ctx context.Context)
+	var wg sync.WaitGroup
 	{
-		rOut, wOut, err := os.Pipe()
-		if err != nil {
-			return err
-		}
-		defer rOut.Close()
-		defer wOut.Close()
 
-		rErr, wErr, err := os.Pipe()
-		if err != nil {
-			return err
+		var wOut, wErr, rOut, rErr *os.File
+		var cwOnce sync.Once
+		closePipes = func(ctx context.Context) {
+			// Idempotently closes the writing end of the pipes. This is called either
+			// when the process returns or when it was killed due to context
+			// cancellation. In the former case, close the writing ends of the pipe
+			// so that the copy goroutines started below return (without missing any
+			// output). In the context cancellation case, we set a deadline to force
+			// the goroutines to quit eagerly. This is important since the command
+			// may have duplicated wOut and wErr to its possible subprocesses, which
+			// may continue to run for long periods of time, and would otherwise
+			// block this command. In theory this is possible also when the command
+			// returns on its own accord, so we set a (more lenient) deadline in the
+			// first case as well.
+			//
+			// NB: there's also the option (at least on *nix) to use a process group,
+			// but it doesn't look portable:
+			// https://medium.com/@felixge/killing-a-child-process-and-all-of-its-children-in-go-54079af94773
+			cwOnce.Do(func() {
+				if wOut != nil {
+					_ = wOut.Close()
+				}
+				if wErr != nil {
+					_ = wErr.Close()
+				}
+				dur := 10 * time.Second // wait up to 10s for subprocesses
+				if ctx.Err() != nil {
+					dur = 10 * time.Millisecond
+				}
+				deadline := timeutil.Now().Add(dur)
+				if rOut != nil {
+					_ = rOut.SetReadDeadline(deadline)
+				}
+				if rErr != nil {
+					_ = rErr.SetReadDeadline(deadline)
+				}
+			})
 		}
-		defer rErr.Close()
-		defer wErr.Close()
+		defer closePipes(ctx)
+
+		var err error
+		rOut, wOut, err = os.Pipe()
+		if err != nil {
+			return cmdRes{err: err}
+		}
+
+		rErr, wErr, err = os.Pipe()
+		if err != nil {
+			return cmdRes{err: err}
+		}
 
 		cmd.Stdout = wOut
-		wg.Add(3)
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			_, _ = io.Copy(l.stdout, io.TeeReader(rOut, debugStdoutBuffer))
@@ -370,48 +429,81 @@ func execCmd(ctx context.Context, l *logger, args ...string) error {
 		if l.stderr == l.stdout {
 			// If l.stderr == l.stdout, we use only one pipe to avoid
 			// duplicating everything.
-			wg.Done()
 			cmd.Stderr = wOut
 		} else {
 			cmd.Stderr = wErr
+			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				_, _ = io.Copy(l.stderr, io.TeeReader(rErr, debugStderrBuffer))
 			}()
 		}
-
-		go func() {
-			defer wg.Done()
-			<-ctx.Done()
-			// NB: setting a more aggressive deadline here makes TestClusterMonitor flaky.
-			now := timeutil.Now().Add(3 * time.Second)
-			_ = rOut.SetDeadline(now)
-			_ = wOut.SetDeadline(now)
-			_ = rErr.SetDeadline(now)
-			_ = wErr.SetDeadline(now)
-		}()
 	}
 
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	closePipes(ctx)
+	wg.Wait()
+
+	if err != nil {
 		// Context errors opaquely appear as "signal killed" when manifested.
 		// We surface this error explicitly.
 		if ctx.Err() != nil {
-			err = ctx.Err()
+			err = errors.CombineErrors(ctx.Err(), err)
 		}
 
-		// Synchronize access to ring buffers before using them to create an
-		// error to return.
-		cancel()
-		wg.Wait()
-		return errors.Wrapf(
-			err,
-			"%s returned:\nstderr:\n%s\nstdout:\n%s",
-			strings.Join(args, " "),
-			debugStderrBuffer.String(),
-			debugStdoutBuffer.String(),
-		)
+		if err != nil {
+			err = &withCommandDetails{
+				cause:  err,
+				cmd:    strings.Join(args, " "),
+				stderr: debugStderrBuffer.String(),
+				stdout: debugStdoutBuffer.String(),
+			}
+		}
 	}
-	return nil
+
+	return cmdRes{
+		err:    err,
+		stdout: debugStdoutBuffer.String(),
+		stderr: debugStderrBuffer.String(),
+	}
+}
+
+type withCommandDetails struct {
+	cause  error
+	cmd    string
+	stderr string
+	stdout string
+}
+
+var _ error = (*withCommandDetails)(nil)
+var _ errors.Formatter = (*withCommandDetails)(nil)
+
+// Error implements error.
+func (e *withCommandDetails) Error() string { return e.cause.Error() }
+
+// Cause implements causer.
+func (e *withCommandDetails) Cause() error { return e.cause }
+
+// Format implements fmt.Formatter.
+func (e *withCommandDetails) Format(s fmt.State, verb rune) { errors.FormatError(e, s, verb) }
+
+// FormatError implements errors.Formatter.
+func (e *withCommandDetails) FormatError(p errors.Printer) error {
+	p.Printf("%s returned", e.cmd)
+	if p.Detail() {
+		p.Printf("stderr:\n%s\nstdout:\n%s", e.stderr, e.stdout)
+	}
+	return e.cause
+}
+
+// GetStderr retrieves the stderr output of a command that
+// returned with an error, or the empty string if there was no stderr.
+func GetStderr(err error) string {
+	var c *withCommandDetails
+	if errors.As(err, &c) {
+		return c.stderr
+	}
+	return ""
 }
 
 // execCmdWithBuffer executes the given command and returns its stdout/stderr
@@ -1104,7 +1196,7 @@ func (f *clusterFactory) newCluster(
 	logPath := filepath.Join(f.artifactsDir, runnerLogsDir, "cluster-create", name+".log")
 	l, err := rootLogger(logPath, teeOpt)
 	if err != nil {
-		log.Fatal(ctx, err)
+		log.Fatalf(ctx, "%v", err)
 	}
 
 	success := false
@@ -1117,7 +1209,7 @@ func (f *clusterFactory) newCluster(
 			break
 		}
 		l.PrintfCtx(ctx, "Failed to create cluster.")
-		if !strings.Contains(err.Error(), "already exists") {
+		if !strings.Contains(GetStderr(err), "already exists") {
 			l.PrintfCtx(ctx, "Cleaning up in case it was partially created.")
 			c.Destroy(ctx, closeLogger, l)
 		} else {
@@ -1376,14 +1468,24 @@ func (c *cluster) FetchDebugZip(ctx context.Context) error {
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return err
 		}
-		// `./cockroach debug zip` is noisy. Suppress the output unless it fails.
-		output, err := execCmdWithBuffer(ctx, c.l, roachprod, "ssh", c.name+":1", "--",
-			"./cockroach", "debug", "zip", "--url", "{pgurl:1}", zipName)
-		if err != nil {
-			c.l.Printf("./cockroach debug zip failed: %s", output)
-			return err
+		// Some nodes might be down, so try to find one that works. We make the
+		// assumption that a down node will refuse the connection, so it won't
+		// waste our time.
+		for i := 1; i <= c.spec.NodeCount; i++ {
+			// `./cockroach debug zip` is noisy. Suppress the output unless it fails.
+			si := strconv.Itoa(i)
+			output, err := execCmdWithBuffer(ctx, c.l, roachprod, "ssh", c.name+":"+si, "--",
+				"./cockroach", "debug", "zip", "--url", "{pgurl:"+si+"}", zipName)
+			if err != nil {
+				c.l.Printf("./cockroach debug zip failed: %s", output)
+				if i < c.spec.NodeCount {
+					continue
+				}
+				return err
+			}
+			return execCmd(ctx, c.l, roachprod, "get", c.name+":"+si, zipName /* src */, path /* dest */)
 		}
-		return execCmd(ctx, c.l, roachprod, "get", c.name+":1", zipName /* src */, path /* dest */)
+		return nil
 	})
 }
 
@@ -1419,7 +1521,13 @@ func (c *cluster) FailOnDeadNodes(ctx context.Context, t *test) {
 // check since we know that such spurious errors are possibly without any relation
 // to the check having failed.
 func (c *cluster) CheckReplicaDivergenceOnDB(ctx context.Context, db *gosql.DB) error {
+	// NB: we set a statement_timeout since context cancellation won't work here,
+	// see:
+	// https://github.com/cockroachdb/cockroach/pull/34520
+	//
+	// We've seen the consistency checks hang indefinitely in some cases.
 	rows, err := db.QueryContext(ctx, `
+SET statement_timeout = '3m';
 SELECT t.range_id, t.start_key_pretty, t.status, t.detail
 FROM
 crdb_internal.check_consistency(true, '', '') as t
@@ -2038,20 +2146,31 @@ func (c *cluster) RunWithBuffer(
 // and communication from a test driver to nodes in a cluster should use
 // external IPs.
 func (c *cluster) pgURL(ctx context.Context, node nodeListOption, external bool) []string {
-	args := []string{`pgurl`}
+	args := []string{roachprod, "pgurl"}
 	if external {
 		args = append(args, `--external`)
 	}
-	args = append(args, c.makeNodes(node))
-	cmd := exec.CommandContext(ctx, roachprod, args...)
-	output, err := cmd.Output()
-	if err != nil {
-		fmt.Println(strings.Join(cmd.Args, ` `))
-		c.t.Fatal(err)
+	nodes := c.makeNodes(node)
+	args = append(args, nodes)
+	cmd := execCmdEx(ctx, c.l, args...)
+	if cmd.err != nil {
+		c.t.Fatal(errors.Wrapf(cmd.err, "failed to get pgurl for nodes: %s", nodes))
 	}
-	urls := strings.Split(strings.TrimSpace(string(output)), " ")
+	urls := strings.Split(strings.TrimSpace(cmd.stdout), " ")
+	if len(urls) != len(node) {
+		c.t.Fatalf(
+			"pgurl for nodes %v got urls %v from stdout:\n%s\nstderr:\n%s",
+			node, urls, cmd.stdout, cmd.stderr,
+		)
+	}
 	for i := range urls {
 		urls[i] = strings.Trim(urls[i], "'")
+		if urls[i] == "" {
+			c.t.Fatalf(
+				"pgurl for nodes %s empty: %v from\nstdout:\n%s\nstderr:\n%s",
+				urls, node, cmd.stdout, cmd.stderr,
+			)
+		}
 	}
 	return urls
 }
@@ -2439,7 +2558,7 @@ func (m *monitor) wait(args ...string) error {
 		cmd.Stdout = io.MultiWriter(pipeW, monL.stdout)
 		cmd.Stderr = monL.stderr
 		if err := cmd.Run(); err != nil {
-			if err != context.Canceled && !strings.Contains(err.Error(), "killed") {
+			if !errors.Is(err, context.Canceled) && !strings.Contains(err.Error(), "killed") {
 				// The expected reason for an error is that the monitor was killed due
 				// to the context being canceled. Any other error is an actual error.
 				setMonitorCmdErr(err)
@@ -2479,6 +2598,7 @@ func (m *monitor) wait(args ...string) error {
 }
 
 func waitForFullReplication(t *test, db *gosql.DB) {
+	t.l.Printf("waiting for up-replication...\n")
 	tStart := timeutil.Now()
 	for ok := false; !ok; time.Sleep(time.Second) {
 		if err := db.QueryRow(

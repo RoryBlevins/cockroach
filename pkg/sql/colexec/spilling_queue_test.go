@@ -16,7 +16,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -56,12 +59,12 @@ func TestSpillingQueue(t *testing.T) {
 				prefix, humanizeutil.IBytes(memoryLimit), diskQueueCacheMode, alwaysCompress, numBatches), func(t *testing.T) {
 				// Create random input.
 				batches := make([]coldata.Batch, 0, numBatches)
-				op := NewRandomDataOp(testAllocator, rng, RandomDataOpArgs{
+				op := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
 					NumBatches: cap(batches),
 					BatchSize:  1 + rng.Intn(coldata.BatchSize()),
 					Nulls:      true,
-					BatchAccumulator: func(b coldata.Batch) {
-						batches = append(batches, CopyBatch(testAllocator, b))
+					BatchAccumulator: func(b coldata.Batch, typs []*types.T) {
+						batches = append(batches, coldatatestutils.CopyBatch(b, typs, testColumnFactory))
 					},
 				})
 				typs := op.Typs()
@@ -75,12 +78,14 @@ func TestSpillingQueue(t *testing.T) {
 				if rewindable {
 					q = newRewindableSpillingQueue(
 						testAllocator, typs, memoryLimit, queueCfg,
-						NewTestingSemaphore(2), coldata.BatchSize(),
+						colexecbase.NewTestingSemaphore(2), coldata.BatchSize(),
+						testDiskAcc,
 					)
 				} else {
 					q = newSpillingQueue(
 						testAllocator, typs, memoryLimit, queueCfg,
-						NewTestingSemaphore(2), coldata.BatchSize(),
+						colexecbase.NewTestingSemaphore(2), coldata.BatchSize(),
+						testDiskAcc,
 					)
 				}
 
@@ -97,7 +102,7 @@ func TestSpillingQueue(t *testing.T) {
 						break
 					}
 					if rng.Float64() < dequeuedProbabilityBeforeAllEnqueuesAreDone {
-						if b, err = q.dequeue(); err != nil {
+						if b, err = q.dequeue(ctx); err != nil {
 							t.Fatal(err)
 						} else if b.Length() == 0 {
 							t.Fatal("queue incorrectly considered empty")
@@ -113,7 +118,7 @@ func TestSpillingQueue(t *testing.T) {
 				for i := 0; i < numReadIterations; i++ {
 					batchIdx := 0
 					for batches[batchIdx].Length() > 0 {
-						if b, err = q.dequeue(); err != nil {
+						if b, err = q.dequeue(ctx); err != nil {
 							t.Fatal(err)
 						} else if b == nil {
 							t.Fatal("unexpectedly dequeued nil batch")
@@ -124,7 +129,7 @@ func TestSpillingQueue(t *testing.T) {
 						batchIdx++
 					}
 
-					if b, err := q.dequeue(); err != nil {
+					if b, err := q.dequeue(ctx); err != nil {
 						t.Fatal(err)
 					} else if b.Length() != 0 {
 						t.Fatal("queue should be empty")
@@ -136,10 +141,10 @@ func TestSpillingQueue(t *testing.T) {
 				}
 
 				// Close queue.
-				require.NoError(t, q.close())
+				require.NoError(t, q.close(ctx))
 
 				// Verify no directories are left over.
-				directories, err := queueCfg.FS.ListDir(queueCfg.Path)
+				directories, err := queueCfg.FS.List(queueCfg.Path)
 				require.NoError(t, err)
 				require.Equal(t, 0, len(directories))
 			})

@@ -84,7 +84,8 @@ func TestNumericConstantVerifyAndResolveAvailableTypes(t *testing.T) {
 
 		// Make sure it can be resolved as each of those types.
 		for _, availType := range avail {
-			if res, err := c.ResolveAsType(&tree.SemaContext{}, availType); err != nil {
+			semaCtx := tree.MakeSemaContext()
+			if res, err := c.ResolveAsType(&semaCtx, availType); err != nil {
 				t.Errorf("%d: expected resolving %v as available type %s would succeed, found %v",
 					i, c.ExactString(), availType, err)
 			} else {
@@ -176,7 +177,16 @@ func TestStringConstantVerifyAvailableTypes(t *testing.T) {
 
 		// Make sure it can be resolved as each of those types or throws a parsing error.
 		for _, availType := range avail {
-			if _, err := test.c.ResolveAsType(&tree.SemaContext{}, availType); err != nil {
+
+			// The enum value in c.AvailableTypes() is AnyEnum, so we will not be able to
+			// resolve that exact type. In actual execution, the constant would be resolved
+			// as a hydrated enum type instead.
+			if availType.Family() == types.EnumFamily {
+				continue
+			}
+
+			semaCtx := tree.MakeSemaContext()
+			if _, err := test.c.ResolveAsType(&semaCtx, availType); err != nil {
 				if !strings.Contains(err.Error(), "could not parse") {
 					// Parsing errors are permitted for this test, as proper tree.StrVal parsing
 					// is tested in TestStringConstantTypeResolution. Any other error should
@@ -377,7 +387,16 @@ func TestStringConstantResolveAvailableTypes(t *testing.T) {
 
 		// Make sure it can be resolved as each of those types or throws a parsing error.
 		for _, availType := range test.c.AvailableTypes() {
-			res, err := test.c.ResolveAsType(&tree.SemaContext{}, availType)
+
+			// The enum value in c.AvailableTypes() is AnyEnum, so we will not be able to
+			// resolve that exact type. In actual execution, the constant would be resolved
+			// as a hydrated enum type instead.
+			if availType.Family() == types.EnumFamily {
+				continue
+			}
+
+			semaCtx := tree.MakeSemaContext()
+			res, err := test.c.ResolveAsType(&semaCtx, availType)
 			if err != nil {
 				if !strings.Contains(err.Error(), "could not parse") && !strings.Contains(err.Error(), "parsing") {
 					// Parsing errors are permitted for this test, but the number of correctly

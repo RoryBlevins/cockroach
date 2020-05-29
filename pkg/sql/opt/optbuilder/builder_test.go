@@ -100,7 +100,10 @@ func TestBuilder(t *testing.T) {
 				ctx := context.Background()
 				semaCtx := tree.MakeSemaContext()
 				evalCtx := tree.MakeTestingEvalContext(cluster.MakeTestingClusterSettings())
-				evalCtx.SessionData.OptimizerFKs = true
+				evalCtx.SessionData.OptimizerFKChecks = true
+				evalCtx.SessionData.OptimizerFKCascades = true
+				evalCtx.SessionData.OptimizerUseHistograms = true
+				evalCtx.SessionData.OptimizerUseMultiColStats = true
 
 				var o xform.Optimizer
 				o.Init(&evalCtx, catalog)
@@ -111,7 +114,6 @@ func TestBuilder(t *testing.T) {
 				// of the build process.
 				o.DisableOptimizations()
 				b := optbuilder.NewScalar(ctx, &semaCtx, &evalCtx, o.Factory())
-				b.AllowUnsupportedExpr = tester.Flags.AllowUnsupportedExpr
 				err = b.Build(expr)
 				if err != nil {
 					return fmt.Sprintf("error: %s\n", strings.TrimSpace(err.Error()))

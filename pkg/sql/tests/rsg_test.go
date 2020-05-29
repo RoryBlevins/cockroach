@@ -41,8 +41,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 )
 
 var (
@@ -106,7 +106,7 @@ type crasher struct {
 	detail string
 }
 
-func (c crasher) Error() string {
+func (c *crasher) Error() string {
 	return fmt.Sprintf("server panic: %s", c.err)
 }
 
@@ -115,7 +115,7 @@ type nonCrasher struct {
 	err error
 }
 
-func (c nonCrasher) Error() string {
+func (c *nonCrasher) Error() string {
 	return c.err.Error()
 }
 
@@ -135,10 +135,10 @@ func (db *verifyFormatDB) exec(ctx context.Context, sql string) error {
 	select {
 	case err := <-funcdone:
 		if err != nil {
-			if pqerr, ok := err.(*pq.Error); ok {
+			if pqerr := (*pq.Error)(nil); errors.As(err, &pqerr) {
 				// Output Postgres error code if it's available.
 				if pqerr.Code == pgcode.CrashShutdown {
-					return crasher{
+					return &crasher{
 						sql:    sql,
 						err:    err,
 						detail: pqerr.Detail,
@@ -148,12 +148,12 @@ func (db *verifyFormatDB) exec(ctx context.Context, sql string) error {
 			if es := err.Error(); strings.Contains(es, "internal error") ||
 				strings.Contains(es, "driver: bad connection") ||
 				strings.Contains(es, "unexpected error inside CockroachDB") {
-				return crasher{
+				return &crasher{
 					sql: sql,
 					err: err,
 				}
 			}
-			return nonCrasher{sql: sql, err: err}
+			return &nonCrasher{sql: sql, err: err}
 		}
 		return nil
 	case <-time.After(*flagRSGExecTimeout):
@@ -527,7 +527,7 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 	}, func(ctx context.Context, db *verifyFormatDB, r *rsg.RSG) error {
 		s := smither.Generate()
 		err := db.exec(ctx, s)
-		if c, ok := err.(crasher); ok {
+		if c := (*crasher)(nil); errors.As(err, &c) {
 			if err := db.exec(ctx, "USE defaultdb"); err != nil {
 				t.Fatalf("couldn't reconnect to db after crasher: %v", c)
 			}
@@ -561,7 +561,6 @@ func TestRandomSyntaxSQLSmith(t *testing.T) {
 func TestRandomDatumRoundtrip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
-	sema := tree.MakeSemaContext()
 	eval := tree.MakeTestingEvalContext(nil)
 
 	var smither *sqlsmith.Smither
@@ -599,6 +598,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		}
 		serializedGen := tree.Serialize(generated)
 
+		sema := tree.MakeSemaContext()
 		// We don't care about errors below because they are often
 		// caused by sqlsmith generating bogus queries. We're just
 		// looking for datums that don't match.
@@ -606,7 +606,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		typed1, err := parsed1.TypeCheck(&sema, typ)
+		typed1, err := parsed1.TypeCheck(ctx, &sema, typ)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -620,7 +620,7 @@ func TestRandomDatumRoundtrip(t *testing.T) {
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
-		typed2, err := parsed2.TypeCheck(&sema, typ)
+		typed2, err := parsed2.TypeCheck(ctx, &sema, typ)
 		if err != nil {
 			return nil //nolint:returnerrcheck
 		}
@@ -729,7 +729,7 @@ func testRandomSyntax(
 			if err == nil {
 				countsMu.success++
 			} else {
-				if c, ok := err.(crasher); ok {
+				if c := (*crasher)(nil); errors.As(err, &c) {
 					t.Errorf("Crash detected: \n%s\n\nStack trace:\n%s", c.sql, c.detail)
 				}
 			}

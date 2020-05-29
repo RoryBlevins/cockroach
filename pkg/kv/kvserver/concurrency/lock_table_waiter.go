@@ -21,8 +21,12 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
+	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/errors"
 )
 
 // LockTableLivenessPushDelay sets the delay before pushing in order to detect
@@ -41,7 +45,7 @@ var LockTableLivenessPushDelay = settings.RegisterDurationSetting(
 	// the cost on each of a transaction's abandoned locks and instead only pay
 	// it once per abandoned transaction per range or per node. This could come
 	// in a few different forms, including:
-	// - a per-wide cache of recently detected abandoned transaction IDs
+	// - a per-store cache of recently detected abandoned transaction IDs
 	// - a per-range reverse index from transaction ID to locked keys
 	//
 	// TODO(nvanbenschoten): increasing this default value.
@@ -78,10 +82,21 @@ var LockTableDeadlockDetectionPushDelay = settings.RegisterDurationSetting(
 
 // lockTableWaiterImpl is an implementation of lockTableWaiter.
 type lockTableWaiterImpl struct {
-	nodeID  roachpb.NodeID
 	st      *cluster.Settings
 	stopper *stop.Stopper
 	ir      IntentResolver
+	lm      LockManager
+
+	// finalizedTxnCache is a small LRU cache that tracks transactions that
+	// were pushed and found to be finalized (COMMITTED or ABORTED). It is
+	// used as an optimization to avoid repeatedly pushing the transaction
+	// record when cleaning up the intents of an abandoned transaction.
+	//
+	// NOTE: it probably makes sense to maintain a single finalizedTxnCache
+	// across all Ranges on a Store instead of an individual cache per
+	// Range. For now, we don't do this because we don't share any state
+	// between separate concurrency.Manager instances.
+	finalizedTxnCache txnCache
 
 	// When set, WriteIntentError are propagated instead of pushing
 	// conflicting transactions.
@@ -98,16 +113,19 @@ type IntentResolver interface {
 	// pushed successfully.
 	PushTransaction(
 		context.Context, *enginepb.TxnMeta, roachpb.Header, roachpb.PushTxnType,
-	) (roachpb.Transaction, *Error)
+	) (*roachpb.Transaction, *Error)
 
-	// ResolveIntent resolves the provided intent according to the options.
+	// ResolveIntent synchronously resolves the provided intent.
 	ResolveIntent(context.Context, roachpb.LockUpdate, intentresolver.ResolveOptions) *Error
+
+	// ResolveIntents synchronously resolves the provided batch of intents.
+	ResolveIntents(context.Context, []roachpb.LockUpdate, intentresolver.ResolveOptions) *Error
 }
 
 // WaitOn implements the lockTableWaiter interface.
 func (w *lockTableWaiterImpl) WaitOn(
 	ctx context.Context, req Request, guard lockTableGuard,
-) *Error {
+) (err *Error) {
 	newStateC := guard.NewStateChan()
 	ctxDoneC := ctx.Done()
 	shouldQuiesceC := w.stopper.ShouldQuiesce()
@@ -115,12 +133,22 @@ func (w *lockTableWaiterImpl) WaitOn(
 	var timer *timeutil.Timer
 	var timerC <-chan time.Time
 	var timerWaitingState waitingState
+	// Used to defer the resolution of duplicate intents. Intended to allow
+	// batching of intent resolution while cleaning up after abandoned txns. A
+	// request may begin deferring intent resolution and then be forced to wait
+	// again on other locks. This is ok, as the request that deferred intent
+	// resolution will often be the new reservation holder for those intents'
+	// keys. Even when this is not the case (e.g. the request is read-only so it
+	// can't hold reservations), any other requests that slip ahead will simply
+	// re-discover the intent(s) during evaluation and resolve them themselves.
+	var deferredResolution []roachpb.LockUpdate
+	defer w.resolveDeferredIntents(ctx, &err, &deferredResolution)
 	for {
 		select {
 		case <-newStateC:
 			timerC = nil
 			state := guard.CurState()
-			switch state.stateKind {
+			switch state.kind {
 			case waitFor, waitForDistinguished:
 				// waitFor indicates that the request is waiting on another
 				// transaction. This transaction may be the lock holder of a
@@ -137,11 +165,8 @@ func (w *lockTableWaiterImpl) WaitOn(
 				// The purpose of the waitForDistinguished state is to avoid waiting
 				// out the longer deadlock detection delay before recognizing and
 				// recovering from the failure of a transaction coordinator for
-				// *each* of that transaction's previously written intents. If we
-				// had a cache of aborted transaction IDs that allowed us to notice
-				// and quickly resolve abandoned intents then we might be able to
-				// get rid of this state.
-				livenessPush := state.stateKind == waitForDistinguished
+				// *each* of that transaction's previously written intents.
+				livenessPush := state.kind == waitForDistinguished
 				deadlockPush := true
 
 				// If the conflict is a reservation holder and not a held lock then
@@ -164,6 +189,54 @@ func (w *lockTableWaiterImpl) WaitOn(
 				// reason, continue waiting.
 				if !livenessPush && !deadlockPush {
 					continue
+				}
+
+				// If we know that a lock holder is already finalized (COMMITTED
+				// or ABORTED), there's no reason to push it again. Instead, we
+				// can skip directly to intent resolution.
+				//
+				// As an optimization, we defer the intent resolution until the
+				// we're done waiting on all conflicting locks in this function.
+				// This allows us to accumulate a group of intents to resolve
+				// and send them together as a batch.
+				//
+				// Remember that if the lock is held, there will be at least one
+				// waiter with livenessPush = true (the distinguished waiter),
+				// so at least one request will enter this branch and perform
+				// the cleanup on behalf of all other waiters.
+				if livenessPush {
+					if pusheeTxn, ok := w.finalizedTxnCache.get(state.txn.ID); ok {
+						resolve := roachpb.MakeLockUpdate(pusheeTxn, roachpb.Span{Key: state.key})
+						deferredResolution = append(deferredResolution, resolve)
+
+						// Inform the LockManager that the lock has been updated with a
+						// finalized status so that it gets removed from the lockTable
+						// and we are allowed to proceed.
+						//
+						// For unreplicated locks, this is all that is needed - the
+						// lockTable is the source of truth so, once removed, the
+						// unreplicated lock is gone. It is perfectly valid for us to
+						// instruct the lock to be released because we know that the
+						// lock's owner is finalized.
+						//
+						// For replicated locks, this is a bit of a lie. The lock hasn't
+						// actually been updated yet, but we will be conducting intent
+						// resolution in the future (before we observe the corresponding
+						// MVCC state). This is safe because we already handle cases
+						// where locks exist only in the MVCC keyspace and not in the
+						// lockTable.
+						//
+						// In the future, we'd like to make this more explicit.
+						// Specifically, we'd like to augment the lockTable with an
+						// understanding of finalized but not yet resolved locks. These
+						// locks will allow conflicting transactions to proceed with
+						// evaluation without the need to first remove all traces of
+						// them via a round of replication. This is discussed in more
+						// detail in #41720. Specifically, see mention of "contention
+						// footprint" and COMMITTED_BUT_NOT_REMOVABLE.
+						w.lm.OnLockUpdated(ctx, &deferredResolution[len(deferredResolution)-1])
+						continue
+					}
 				}
 
 				// The request should push to detect abandoned locks due to
@@ -265,7 +338,6 @@ func (w *lockTableWaiterImpl) WaitOn(
 			// behind a lock. In this case, the request has a dependency on the
 			// conflicting request but not necessarily the entire conflicting
 			// transaction.
-			var err *Error
 			if timerWaitingState.held {
 				err = w.pushLockTxn(ctx, req, timerWaitingState)
 			} else {
@@ -278,12 +350,12 @@ func (w *lockTableWaiterImpl) WaitOn(
 				pushCtx, pushCancel := context.WithCancel(ctx)
 				go w.watchForNotifications(pushCtx, pushCancel, newStateC)
 				err = w.pushRequestTxn(pushCtx, req, timerWaitingState)
-				pushCancel()
-				if pushCtx.Err() == context.Canceled {
+				if errors.Is(pushCtx.Err(), context.Canceled) {
 					// Ignore the context canceled error. If this was for the
 					// parent context then we'll notice on the next select.
 					err = nil
 				}
+				pushCancel()
 			}
 			if err != nil {
 				return err
@@ -296,6 +368,28 @@ func (w *lockTableWaiterImpl) WaitOn(
 			return roachpb.NewError(&roachpb.NodeUnavailableError{})
 		}
 	}
+}
+
+// WaitOnLock implements the lockTableWaiter interface.
+func (w *lockTableWaiterImpl) WaitOnLock(
+	ctx context.Context, req Request, intent *roachpb.Intent,
+) *Error {
+	sa, _, err := findAccessInSpans(intent.Key, req.LockSpans)
+	if err != nil {
+		return roachpb.NewError(err)
+	}
+	return w.pushLockTxn(ctx, req, waitingState{
+		kind:        waitFor,
+		txn:         &intent.Txn,
+		key:         intent.Key,
+		held:        true,
+		guardAccess: sa,
+	})
+}
+
+// ClearCaches implements the lockTableWaiter interface.
+func (w *lockTableWaiterImpl) ClearCaches() {
+	w.finalizedTxnCache.clear()
 }
 
 // pushLockTxn pushes the holder of the provided lock.
@@ -319,18 +413,27 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 	// under the lock. For write-write conflicts, try to abort the lock holder
 	// entirely so the write request can revoke and replace the lock with its
 	// own lock.
+	h := w.pushHeader(req)
 	var pushType roachpb.PushTxnType
 	switch ws.guardAccess {
 	case spanset.SpanReadOnly:
 		pushType = roachpb.PUSH_TIMESTAMP
+		log.VEventf(ctx, 3, "pushing timestamp of txn %s above %s", ws.txn.ID.Short(), h.Timestamp)
 	case spanset.SpanReadWrite:
 		pushType = roachpb.PUSH_ABORT
+		log.VEventf(ctx, 3, "pushing txn %s to abort", ws.txn.ID.Short())
 	}
 
-	h := w.pushHeader(req)
 	pusheeTxn, err := w.ir.PushTransaction(ctx, ws.txn, h, pushType)
 	if err != nil {
 		return err
+	}
+
+	// If the transaction is finalized, add it to the finalizedTxnCache. This
+	// avoids needing to push it again if we find another one of its locks and
+	// allows for batching of intent resolution.
+	if pusheeTxn.Status.IsFinalized() {
+		w.finalizedTxnCache.add(pusheeTxn)
 	}
 
 	// If the push succeeded then the lock holder transaction must have
@@ -360,7 +463,7 @@ func (w *lockTableWaiterImpl) pushLockTxn(
 	// with the responsibility to abort the intents (for example if we find the
 	// transaction aborted). To do better here, we need per-intent information
 	// on whether we need to poison.
-	resolve := roachpb.MakeLockUpdateWithDur(&pusheeTxn, roachpb.Span{Key: ws.key}, ws.dur)
+	resolve := roachpb.MakeLockUpdate(pusheeTxn, roachpb.Span{Key: ws.key})
 	opts := intentresolver.ResolveOptions{Poison: true}
 	return w.ir.ResolveIntent(ctx, resolve, opts)
 }
@@ -389,10 +492,15 @@ func (w *lockTableWaiterImpl) pushRequestTxn(
 	// because it wants to block until either a) the pushee or the pusher is
 	// aborted due to a deadlock or b) the request exits the lock wait-queue and
 	// the caller of this function cancels the push.
-	pushType := roachpb.PUSH_ABORT
-
 	h := w.pushHeader(req)
+	pushType := roachpb.PUSH_ABORT
+	log.VEventf(ctx, 3, "pushing txn %s to detect request deadlock", ws.txn.ID.Short())
+
 	_, err := w.ir.PushTransaction(ctx, ws.txn, h, pushType)
+	if err != nil {
+		return err
+	}
+
 	// Even if the push succeeded and aborted the other transaction to break a
 	// deadlock, there's nothing for the pusher to clean up. The conflicting
 	// request will quickly exit the lock wait-queue and release its reservation
@@ -400,33 +508,78 @@ func (w *lockTableWaiterImpl) pushRequestTxn(
 	// because it was not waiting on any locks. If the pusher's request does end
 	// up hitting a lock which the pushee fails to clean up, it will perform the
 	// cleanup itself using pushLockTxn.
-	return err
+	//
+	// It may appear that there is a bug here in the handling of request-only
+	// dependency cycles. If such a cycle was broken by simultaneously aborting
+	// the transactions responsible for each of the request, there would be no
+	// guarantee that an aborted pusher would notice that its own transaction
+	// was aborted before it notices that its pushee's transaction was aborted.
+	// For example, in the simplest case, imagine two requests deadlocked on
+	// each other. If their transactions are both aborted and each push notices
+	// the pushee is aborted first, they will both return here triumphantly and
+	// wait for the other to exit its lock wait-queues, leading to deadlock.
+	// Even if they eventually pushed each other again, there would be no
+	// guarantee that the same thing wouldn't happen.
+	//
+	// However, such a situation is not possible in practice because such a
+	// dependency cycle is never constructed by the lockTable. The lockTable
+	// assigns each request a monotonically increasing sequence number upon its
+	// initial entrance to the lockTable. This sequence number is used to
+	// straighten out dependency chains of requests such that a request only
+	// waits on conflicting requests with lower sequence numbers than its own
+	// sequence number. This behavior guarantees that request-only dependency
+	// cycles are never constructed by the lockTable. Put differently, all
+	// dependency cycles must include at least one dependency on a lock and,
+	// therefore, one call to pushLockTxn. Unlike pushRequestTxn, pushLockTxn
+	// actively removes the conflicting lock and removes the dependency when it
+	// determines that its pushee transaction is aborted. This means that the
+	// call to pushLockTxn will continue to make forward progress in the case of
+	// a simultaneous abort of all transactions behind the members of the cycle,
+	// preventing such a hypothesized deadlock from ever materializing.
+	//
+	// Example:
+	//
+	//  req(1, txn1), req(1, txn2) are both waiting on a lock held by txn3, and
+	//  they respectively hold a reservation on key "a" and key "b". req(2, txn2)
+	//  queues up behind the reservation on key "a" and req(2, txn1) queues up
+	//  behind the reservation on key "b". Now the dependency cycle between txn1
+	//  and txn2 only involves requests, but some of the requests here also
+	//  depend on a lock. So when both txn1, txn2 are aborted, the req(1, txn1),
+	//  req(1, txn2) are guaranteed to eventually notice through self-directed
+	//  QueryTxn requests and will exit the lockTable, allowing req(2, txn1) and
+	//  req(2, txn2) to get the reservation and now they no longer depend on each
+	//  other.
+	//
+	return nil
 }
 
 func (w *lockTableWaiterImpl) pushHeader(req Request) roachpb.Header {
 	h := roachpb.Header{
-		Timestamp:    req.Timestamp,
+		Timestamp:    req.readConflictTimestamp(),
 		UserPriority: req.Priority,
 	}
 	if req.Txn != nil {
-		// We are going to hand the header (and thus the transaction proto)
-		// to the RPC framework, after which it must not be changed (since
-		// that could race). Since the subsequent execution of the original
-		// request might mutate the transaction, make a copy here.
-		//
-		// See #9130.
+		// We are going to hand the header (and thus the transaction proto) to
+		// the RPC framework, after which it must not be changed (since that
+		// could race). Since the subsequent execution of the original request
+		// might mutate the transaction, make a copy here. See #9130.
 		h.Txn = req.Txn.Clone()
-
-		// We must push at least to h.Timestamp, but in fact we want to
-		// go all the way up to a timestamp which was taken off the HLC
-		// after our operation started. This allows us to not have to
-		// restart for uncertainty as we come back and read.
-		obsTS, ok := h.Txn.GetObservedTimestamp(w.nodeID)
-		if ok {
-			h.Timestamp.Forward(obsTS)
-		}
 	}
 	return h
+}
+
+// resolveDeferredIntents resolves the batch of intents if the provided error is
+// nil. The batch of intents may be resolved more efficiently than if they were
+// resolved individually.
+func (w *lockTableWaiterImpl) resolveDeferredIntents(
+	ctx context.Context, err **Error, deferredResolution *[]roachpb.LockUpdate,
+) {
+	if (*err != nil) || (len(*deferredResolution) == 0) {
+		return
+	}
+	// See pushLockTxn for an explanation of these options.
+	opts := intentresolver.ResolveOptions{Poison: true}
+	*err = w.ir.ResolveIntents(ctx, *deferredResolution, opts)
 }
 
 // watchForNotifications selects on the provided channel and watches for any
@@ -446,6 +599,62 @@ func (w *lockTableWaiterImpl) watchForNotifications(
 		cancel()
 	case <-ctx.Done():
 	}
+}
+
+// txnCache is a small LRU cache that holds Transaction objects.
+//
+// The zero value of this struct is ready for use.
+type txnCache struct {
+	mu   syncutil.Mutex
+	txns [8]*roachpb.Transaction // [MRU, ..., LRU]
+}
+
+func (c *txnCache) get(id uuid.UUID) (*roachpb.Transaction, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if idx := c.getIdxLocked(id); idx >= 0 {
+		txn := c.txns[idx]
+		c.moveFrontLocked(txn, idx)
+		return txn, true
+	}
+	return nil, false
+}
+
+func (c *txnCache) add(txn *roachpb.Transaction) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if idx := c.getIdxLocked(txn.ID); idx >= 0 {
+		c.moveFrontLocked(txn, idx)
+	} else {
+		c.insertFrontLocked(txn)
+	}
+}
+
+func (c *txnCache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.txns {
+		c.txns[i] = nil
+	}
+}
+
+func (c *txnCache) getIdxLocked(id uuid.UUID) int {
+	for i, txn := range c.txns {
+		if txn != nil && txn.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func (c *txnCache) moveFrontLocked(txn *roachpb.Transaction, cur int) {
+	copy(c.txns[1:cur+1], c.txns[:cur])
+	c.txns[0] = txn
+}
+
+func (c *txnCache) insertFrontLocked(txn *roachpb.Transaction) {
+	copy(c.txns[1:], c.txns[:])
+	c.txns[0] = txn
 }
 
 func hasMinPriority(txn *enginepb.TxnMeta) bool {

@@ -12,13 +12,11 @@ package pgerror
 
 import (
 	"bytes"
-	goErr "errors"
 	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
-	"github.com/cockroachdb/cockroach/pkg/util/stacktrace"
 	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
 )
@@ -26,7 +24,6 @@ import (
 var _ error = (*Error)(nil)
 var _ errors.ErrorHinter = (*Error)(nil)
 var _ errors.ErrorDetailer = (*Error)(nil)
-var _ errors.SafeDetailer = (*Error)(nil)
 var _ fmt.Formatter = (*Error)(nil)
 
 // Error implements the error interface.
@@ -38,25 +35,14 @@ func (pg *Error) ErrorHint() string { return pg.Hint }
 // ErrorDetail implements the hintdetail.ErrorDetailer interface.
 func (pg *Error) ErrorDetail() string { return pg.Detail }
 
-// SafeDetails implements the errbase.SafeDetailer interface.
-// TODO(knz): this is provided for compatibility with 19.1 nodes.
-// Remove in 19.3, together with the "SafeDetail" proto field.
-func (pg *Error) SafeDetails() []string {
-	details := make([]string, len(pg.SafeDetail))
-	for i, d := range pg.SafeDetail {
-		details[i] = d.SafeMessage + d.EncodedStackTrace
-	}
-	return details
-}
-
 // FullError can be used when the hint and/or detail are to be tested.
 func FullError(err error) string {
 	var errString string
-	if pqErr, ok := err.(*pq.Error); ok {
-		errString = formatMsgHintDetail("pq: ", pqErr.Message, pqErr.Hint, pqErr.Detail)
+	if pqErr := (*pq.Error)(nil); errors.As(err, &pqErr) {
+		errString = formatMsgHintDetail("pq", pqErr.Message, pqErr.Hint, pqErr.Detail)
 	} else {
 		pg := Flatten(err)
-		errString = formatMsgHintDetail("", err.Error(), pg.Hint, pg.Detail)
+		errString = formatMsgHintDetail(pg.Severity, err.Error(), pg.Hint, pg.Detail)
 	}
 	return errString
 }
@@ -64,6 +50,7 @@ func FullError(err error) string {
 func formatMsgHintDetail(prefix, msg, hint, detail string) string {
 	var b strings.Builder
 	b.WriteString(prefix)
+	b.WriteString(": ")
 	b.WriteString(msg)
 	if hint != "" {
 		b.WriteString("\nHINT: ")
@@ -98,13 +85,6 @@ func Newf(code string, format string, args ...interface{}) error {
 	return err
 }
 
-// Noticef generates a Notice with a format string.
-func Noticef(format string, args ...interface{}) error {
-	err := errors.NewWithDepthf(1, format, args...)
-	err = WithCandidateCode(err, pgcode.SuccessfulCompletion)
-	return err
-}
-
 // DangerousStatementf creates a new error for "rejected dangerous
 // statements".
 func DangerousStatementf(format string, args ...interface{}) error {
@@ -112,7 +92,7 @@ func DangerousStatementf(format string, args ...interface{}) error {
 	buf.WriteString("rejected: ")
 	fmt.Fprintf(&buf, format, args...)
 	buf.WriteString(" (sql_safe_updates = true)")
-	err := goErr.New(buf.String())
+	err := errors.Newf("%s", buf.String())
 	err = errors.WithSafeDetails(err, format, args...)
 	err = WithCandidateCode(err, pgcode.Warning)
 	return err
@@ -141,17 +121,6 @@ func (pg *Error) Format(s fmt.State, verb rune) {
 			fmt.Fprintf(s, "%s:%d in %s(): ", pg.Source.File, pg.Source.Line, pg.Source.Function)
 		}
 		fmt.Fprintf(s, "(%s) %s", pg.Code, pg.Message)
-		for _, d := range pg.SafeDetail {
-			fmt.Fprintf(s, "\n-- detail --\n%s", d.SafeMessage)
-			if d.EncodedStackTrace != "" {
-				st, err := stacktrace.DecodeStackTrace(d.EncodedStackTrace)
-				if err != nil {
-					fmt.Fprintf(s, "unable to encode stack trace: %+v", err)
-				} else {
-					fmt.Fprintf(s, "\n%s", stacktrace.PrintStackTrace(st))
-				}
-			}
-		}
 		return
 	case verb == 'v' && s.Flag('#'):
 		// %#v spells out the code as prefix.

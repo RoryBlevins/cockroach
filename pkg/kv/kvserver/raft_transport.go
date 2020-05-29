@@ -30,7 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/pkg/errors"
+	"github.com/cockroachdb/errors"
 	"go.etcd.io/etcd/raft/raftpb"
 	"google.golang.org/grpc"
 )
@@ -535,8 +535,7 @@ func (t *RaftTransport) getQueue(
 // returns false if the outgoing queue is full. The returned bool may be a false
 // positive but will never be a false negative; if sent is true the message may
 // or may not actually be sent but if it's false the message definitely was not
-// sent. If the method does return true, it is not safe to continue using the
-// reference to the provided request.
+// sent. It is not safe to continue using the reference to the provided request.
 func (t *RaftTransport) SendAsync(req *RaftMessageRequest, class rpc.ConnectionClass) (sent bool) {
 	toNodeID := req.ToReplica.NodeID
 	stats := t.getStats(toNodeID, class)
@@ -546,7 +545,6 @@ func (t *RaftTransport) SendAsync(req *RaftMessageRequest, class rpc.ConnectionC
 		}
 	}()
 
-	ctx := t.AnnotateCtx(context.Background())
 	if req.RangeID == 0 && len(req.Heartbeats) == 0 && len(req.HeartbeatResps) == 0 {
 		// Coalesced heartbeats are addressed to range 0; everything else
 		// needs an explicit range ID.
@@ -563,6 +561,7 @@ func (t *RaftTransport) SendAsync(req *RaftMessageRequest, class rpc.ConnectionC
 	ch, existingQueue := t.getQueue(toNodeID, class)
 	if !existingQueue {
 		// Note that startProcessNewQueue is in charge of deleting the queue.
+		ctx := t.AnnotateCtx(context.Background())
 		if !t.startProcessNewQueue(ctx, toNodeID, class, stats) {
 			return false
 		}
@@ -576,6 +575,7 @@ func (t *RaftTransport) SendAsync(req *RaftMessageRequest, class rpc.ConnectionC
 		}
 		return true
 	default:
+		req.release()
 		return false
 	}
 }
@@ -614,7 +614,7 @@ func (t *RaftTransport) startProcessNewQueue(
 	worker := func(ctx context.Context) {
 		ch, existingQueue := t.getQueue(toNodeID, class)
 		if !existingQueue {
-			log.Fatalf(t.AnnotateCtx(context.Background()), "queue for n%d does not exist", toNodeID)
+			log.Fatalf(ctx, "queue for n%d does not exist", toNodeID)
 		}
 		defer cleanup(ch)
 		defer t.queues[class].Delete(int64(toNodeID))

@@ -17,8 +17,9 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec/execerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase/colexecerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/colflow"
+	"github.com/cockroachdb/cockroach/pkg/sql/distsql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
@@ -55,9 +56,12 @@ type flowWithNode struct {
 func (n *explainVecNode) startExec(params runParams) error {
 	n.run.values = make(tree.Datums, 1)
 	distSQLPlanner := params.extendedEvalCtx.DistSQLPlanner
-	willDistributePlan, _ := willDistributePlan(distSQLPlanner, n.plan, params)
+	willDistribute := willDistributePlanForExplainPurposes(
+		params.ctx, params.extendedEvalCtx.ExecCfg.NodeID,
+		params.extendedEvalCtx.SessionData.DistSQLMode, n.plan,
+	)
 	outerSubqueries := params.p.curPlan.subqueryPlans
-	planCtx := makeExplainVecPlanningCtx(distSQLPlanner, params, n.stmtType, n.subqueryPlans, willDistributePlan)
+	planCtx := makeExplainPlanningCtx(distSQLPlanner, params, n.stmtType, n.subqueryPlans, willDistribute)
 	defer func() {
 		planCtx.planner.curPlan.subqueryPlans = outerSubqueries
 	}()
@@ -71,15 +75,23 @@ func (n *explainVecNode) startExec(params runParams) error {
 	}
 
 	distSQLPlanner.FinalizePlan(planCtx, &plan)
-	flows := plan.GenerateFlowSpecs(params.extendedEvalCtx.NodeID)
+	nodeID, err := params.extendedEvalCtx.NodeID.OptionalNodeIDErr(distsql.MultiTenancyIssueNo)
+	if err != nil {
+		return err
+	}
+	flows := plan.GenerateFlowSpecs(nodeID)
 	flowCtx := makeFlowCtx(planCtx, plan, params)
 	flowCtx.Cfg.ClusterID = &distSQLPlanner.rpcCtx.ClusterID
 
-	// Temporarily set vectorize to on so that we can get the whole plan back even
-	// if we wouldn't support it due to lack of streaming.
-	origMode := flowCtx.EvalCtx.SessionData.VectorizeMode
-	flowCtx.EvalCtx.SessionData.VectorizeMode = sessiondata.VectorizeExperimentalOn
-	defer func() { flowCtx.EvalCtx.SessionData.VectorizeMode = origMode }()
+	// We want to get the vectorized plan which would be executed with the
+	// current 'vectorize' option. If 'vectorize' is set to 'off', then the
+	// vectorized engine is disabled, and we will return an error in such case.
+	// With all other options, we don't change the setting to the
+	// most-inclusive option as we used to because the plan can be different
+	// based on 'vectorize' setting.
+	if flowCtx.EvalCtx.SessionData.VectorizeMode == sessiondata.VectorizeOff {
+		return errors.New("vectorize is set to 'off'")
+	}
 
 	sortedFlows := make([]flowWithNode, 0, len(flows))
 	for nodeID, flow := range flows {
@@ -89,12 +101,12 @@ func (n *explainVecNode) startExec(params runParams) error {
 	sort.Slice(sortedFlows, func(i, j int) bool { return sortedFlows[i].nodeID < sortedFlows[j].nodeID })
 	tp := treeprinter.NewWithIndent(false /* leftPad */, true /* rightPad */, 0 /* edgeLength */)
 	root := tp.Child("")
-	verbose := n.options.Flags.Contains(tree.ExplainFlagVerbose)
+	verbose := n.options.Flags[tree.ExplainFlagVerbose]
 	thisNodeID := distSQLPlanner.nodeDesc.NodeID
 	for _, flow := range sortedFlows {
 		node := root.Childf("Node %d", flow.nodeID)
 		fuseOpt := flowinfra.FuseNormally
-		if flow.nodeID == thisNodeID && !willDistributePlan {
+		if flow.nodeID == thisNodeID && !willDistribute {
 			fuseOpt = flowinfra.FuseAggressively
 		}
 		opChains, err := colflow.SupportsVectorized(params.ctx, flowCtx, flow.flow.Processors, fuseOpt, nil /* output */)
@@ -104,7 +116,7 @@ func (n *explainVecNode) startExec(params runParams) error {
 		// It is possible that when iterating over execinfra.OpNodes we will hit
 		// a panic (an input that doesn't implement OpNode interface), so we're
 		// catching such errors.
-		if err := execerror.CatchVectorizedRuntimeError(func() {
+		if err := colexecerror.CatchVectorizedRuntimeError(func() {
 			for _, op := range opChains {
 				formatOpChain(op, node, verbose)
 			}
@@ -129,15 +141,15 @@ func makeFlowCtx(planCtx *PlanningCtx, plan PhysicalPlan, params runParams) *exe
 	return flowCtx
 }
 
-func makeExplainVecPlanningCtx(
+func makeExplainPlanningCtx(
 	distSQLPlanner *DistSQLPlanner,
 	params runParams,
 	stmtType tree.StatementType,
 	subqueryPlans []subquery,
-	willDistributePlan bool,
+	willDistribute bool,
 ) *PlanningCtx {
 	planCtx := distSQLPlanner.NewPlanningCtx(params.ctx, params.extendedEvalCtx, params.p.txn)
-	planCtx.isLocal = !willDistributePlan
+	planCtx.isLocal = !willDistribute
 	planCtx.ignoreClose = true
 	planCtx.planner = params.p
 	planCtx.stmtType = stmtType

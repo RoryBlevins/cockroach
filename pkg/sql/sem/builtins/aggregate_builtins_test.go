@@ -86,26 +86,54 @@ func TestAvgIntervalResultDeepCopy(t *testing.T) {
 func TestBitAndIntResultDeepCopy(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	t.Run("all null", func(t *testing.T) {
-		testAggregateResultDeepCopy(t, newBitAndAggregate, makeNullTestDatum(10))
+		testAggregateResultDeepCopy(t, newIntBitAndAggregate, makeNullTestDatum(10))
 	})
 	t.Run("with null", func(t *testing.T) {
-		testAggregateResultDeepCopy(t, newBitAndAggregate, makeTestWithNullDatum(10, makeIntTestDatum))
+		testAggregateResultDeepCopy(t, newIntBitAndAggregate, makeTestWithNullDatum(10, makeIntTestDatum))
 	})
 	t.Run("without null", func(t *testing.T) {
-		testAggregateResultDeepCopy(t, newBitAndAggregate, makeIntTestDatum(10))
+		testAggregateResultDeepCopy(t, newIntBitAndAggregate, makeIntTestDatum(10))
+	})
+}
+
+func TestBitAndBitResultDeepCopy(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	t.Run("all null", func(t *testing.T) {
+		testAggregateResultDeepCopy(t, newBitBitAndAggregate, makeNullTestDatum(10))
+	})
+	t.Run("with null", func(t *testing.T) {
+		testAggregateResultDeepCopy(t, newBitBitAndAggregate, makeTestWithNullDatum(10, makeBitTestDatum))
+	})
+	t.Run("without null", func(t *testing.T) {
+		for i := 0; i < 1000; i++ {
+			testAggregateResultDeepCopy(t, newBitBitAndAggregate, makeBitTestDatum(10))
+		}
 	})
 }
 
 func TestBitOrIntResultDeepCopy(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	t.Run("all null", func(t *testing.T) {
-		testAggregateResultDeepCopy(t, newBitOrAggregate, makeNullTestDatum(10))
+		testAggregateResultDeepCopy(t, newIntBitOrAggregate, makeNullTestDatum(10))
 	})
 	t.Run("with null", func(t *testing.T) {
-		testAggregateResultDeepCopy(t, newBitOrAggregate, makeTestWithNullDatum(10, makeIntTestDatum))
+		testAggregateResultDeepCopy(t, newIntBitOrAggregate, makeTestWithNullDatum(10, makeIntTestDatum))
 	})
 	t.Run("without null", func(t *testing.T) {
-		testAggregateResultDeepCopy(t, newBitOrAggregate, makeIntTestDatum(10))
+		testAggregateResultDeepCopy(t, newIntBitOrAggregate, makeIntTestDatum(10))
+	})
+}
+
+func TestBitOrBitResultDeepCopy(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	t.Run("all null", func(t *testing.T) {
+		testAggregateResultDeepCopy(t, newBitBitOrAggregate, makeNullTestDatum(10))
+	})
+	t.Run("with null", func(t *testing.T) {
+		testAggregateResultDeepCopy(t, newBitBitOrAggregate, makeTestWithNullDatum(10, makeBitTestDatum))
+	})
+	t.Run("without null", func(t *testing.T) {
+		testAggregateResultDeepCopy(t, newBitBitOrAggregate, makeBitTestDatum(10))
 	})
 }
 
@@ -239,6 +267,19 @@ func makeIntTestDatum(count int) []tree.Datum {
 	return vals
 }
 
+func makeBitTestDatum(count int) []tree.Datum {
+	rng, _ := randutil.NewPseudoRand()
+
+	// Compute randWidth outside the loop so that all bit arrays are the same
+	// length. Generate widths in the range [0, 64].
+	vals := make([]tree.Datum, count)
+	randWidth := uint(rng.Intn(65))
+	for i := range vals {
+		vals[i], _ = tree.NewDBitArrayFromInt(rng.Int63(), randWidth)
+	}
+	return vals
+}
+
 // makeTestWithNullDatum will call the maker function
 // to generate an array of datums, and then a null datum
 // will be placed randomly in the array of datums and
@@ -316,12 +357,12 @@ func makeIntervalTestDatum(count int) []tree.Datum {
 
 func TestArrayAggNameOverload(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	testArrayAggAliasedTypeOverload(t, types.Name)
+	testArrayAggAliasedTypeOverload(context.Background(), t, types.Name)
 }
 
 func TestArrayAggOidOverload(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	testArrayAggAliasedTypeOverload(t, types.Oid)
+	testArrayAggAliasedTypeOverload(context.Background(), t, types.Oid)
 }
 
 // testAliasedTypeOverload is a helper function for testing ARRAY_AGG's
@@ -329,7 +370,7 @@ func TestArrayAggOidOverload(t *testing.T) {
 // These tests are necessary because some ORMs (e.g., sequelize) require
 // ARRAY_AGG to work on these aliased types and produce a result with the
 // correct type.
-func testArrayAggAliasedTypeOverload(t *testing.T, expected *types.T) {
+func testArrayAggAliasedTypeOverload(ctx context.Context, t *testing.T, expected *types.T) {
 	defer tree.MockNameTypes(map[string]*types.T{
 		"a": expected,
 	})()
@@ -339,7 +380,7 @@ func testArrayAggAliasedTypeOverload(t *testing.T, expected *types.T) {
 		t.Fatalf("%s: %v", exprStr, err)
 	}
 	typ := types.MakeArray(expected)
-	typedExpr, err := tree.TypeCheck(expr, nil, typ)
+	typedExpr, err := tree.TypeCheck(ctx, expr, nil, typ)
 	if err != nil {
 		t.Fatalf("%s: %v", expr, err)
 	}

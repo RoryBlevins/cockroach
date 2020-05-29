@@ -34,12 +34,12 @@ func genRelativeRankOps(wr io.Writer) error {
 
 	s := string(d)
 
-	s = strings.Replace(s, "_RELATIVE_RANK_STRING", "{{.String}}", -1)
+	s = strings.ReplaceAll(s, "_RELATIVE_RANK_STRING", "{{.String}}")
 
-	computeNumPeersRe := makeFunctionRegex("_COMPUTE_NUM_PEERS", 0)
-	s = computeNumPeersRe.ReplaceAllString(s, `{{template "computeNumPeers"}}`)
-	computeCumeDistRe := makeFunctionRegex("_COMPUTE_CUME_DIST", 0)
-	s = computeCumeDistRe.ReplaceAllString(s, `{{template "computeCumeDist"}}`)
+	computePartitionsSizesRe := makeFunctionRegex("_COMPUTE_PARTITIONS_SIZES", 0)
+	s = computePartitionsSizesRe.ReplaceAllString(s, `{{template "computePartitionsSizes"}}`)
+	computePeerGroupsSizesRe := makeFunctionRegex("_COMPUTE_PEER_GROUPS_SIZES", 0)
+	s = computePeerGroupsSizesRe.ReplaceAllString(s, `{{template "computePeerGroupsSizes"}}`)
 
 	// Now, generate the op, from the template.
 	tmpl, err := template.New("relative_rank_op").Parse(s)

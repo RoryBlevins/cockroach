@@ -16,9 +16,10 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
-	"github.com/cockroachdb/cockroach/pkg/col/coltypes"
+	"github.com/cockroachdb/cockroach/pkg/col/coldatatestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/colcontainer"
-	"github.com/cockroachdb/cockroach/pkg/sql/colexec"
+	"github.com/cockroachdb/cockroach/pkg/sql/colexecbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/colcontainerutils"
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -29,6 +30,7 @@ import (
 func TestDiskQueue(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
+	ctx := context.Background()
 	queueCfg, cleanup := colcontainerutils.NewTestingDiskQueueCfg(t, true /* inMem */)
 	defer cleanup()
 
@@ -61,12 +63,12 @@ func TestDiskQueue(t *testing.T) {
 					prefix, diskQueueCacheMode, alwaysCompress, suffix, numBatches), func(t *testing.T) {
 					// Create random input.
 					batches := make([]coldata.Batch, 0, numBatches)
-					op := colexec.NewRandomDataOp(testAllocator, rng, colexec.RandomDataOpArgs{
+					op := coldatatestutils.NewRandomDataOp(testAllocator, rng, coldatatestutils.RandomDataOpArgs{
 						NumBatches: cap(batches),
 						BatchSize:  1 + rng.Intn(coldata.BatchSize()),
 						Nulls:      true,
-						BatchAccumulator: func(b coldata.Batch) {
-							batches = append(batches, colexec.CopyBatch(testAllocator, b))
+						BatchAccumulator: func(b coldata.Batch, typs []*types.T) {
+							batches = append(batches, coldatatestutils.CopyBatch(b, typs, testColumnFactory))
 						},
 					})
 					typs := op.Typs()
@@ -87,14 +89,14 @@ func TestDiskQueue(t *testing.T) {
 						err error
 					)
 					if rewindable {
-						q, err = colcontainer.NewRewindableDiskQueue(typs, queueCfg)
+						q, err = colcontainer.NewRewindableDiskQueue(ctx, typs, queueCfg, testDiskAcc)
 					} else {
-						q, err = colcontainer.NewDiskQueue(typs, queueCfg)
+						q, err = colcontainer.NewDiskQueue(ctx, typs, queueCfg, testDiskAcc)
 					}
 					require.NoError(t, err)
 
 					// Verify that a directory was created.
-					directories, err := queueCfg.FS.ListDir(queueCfg.Path)
+					directories, err := queueCfg.FS.List(queueCfg.Path)
 					require.NoError(t, err)
 					require.Equal(t, 1, len(directories))
 
@@ -102,12 +104,12 @@ func TestDiskQueue(t *testing.T) {
 					ctx := context.Background()
 					for {
 						b := op.Next(ctx)
-						require.NoError(t, q.Enqueue(b))
+						require.NoError(t, q.Enqueue(ctx, b))
 						if b.Length() == 0 {
 							break
 						}
 						if rng.Float64() < dequeuedProbabilityBeforeAllEnqueuesAreDone {
-							if ok, err := q.Dequeue(b); !ok {
+							if ok, err := q.Dequeue(ctx, b); !ok {
 								t.Fatal("queue incorrectly considered empty")
 							} else if err != nil {
 								t.Fatal(err)
@@ -122,9 +124,9 @@ func TestDiskQueue(t *testing.T) {
 					}
 					for i := 0; i < numReadIterations; i++ {
 						batchIdx := 0
-						b := coldata.NewMemBatch(typs)
+						b := coldata.NewMemBatch(typs, testColumnFactory)
 						for batchIdx < len(batches) {
-							if ok, err := q.Dequeue(b); !ok {
+							if ok, err := q.Dequeue(ctx, b); !ok {
 								t.Fatal("queue incorrectly considered empty")
 							} else if err != nil {
 								t.Fatal(err)
@@ -136,10 +138,10 @@ func TestDiskQueue(t *testing.T) {
 						if testReuseCache {
 							// Trying to Enqueue after a Dequeue should return an error in these
 							// CacheModes.
-							require.Error(t, q.Enqueue(b))
+							require.Error(t, q.Enqueue(ctx, b))
 						}
 
-						if ok, err := q.Dequeue(b); ok {
+						if ok, err := q.Dequeue(ctx, b); ok {
 							if b.Length() != 0 {
 								t.Fatal("queue should be empty")
 							}
@@ -153,10 +155,10 @@ func TestDiskQueue(t *testing.T) {
 					}
 
 					// Close queue.
-					require.NoError(t, q.Close())
+					require.NoError(t, q.Close(ctx))
 
 					// Verify no directories are left over.
-					directories, err = queueCfg.FS.ListDir(queueCfg.Path)
+					directories, err = queueCfg.FS.List(queueCfg.Path)
 					require.NoError(t, err)
 					require.Equal(t, 0, len(directories))
 				})
@@ -198,30 +200,30 @@ func BenchmarkDiskQueue(b *testing.B) {
 	queueCfg.MaxFileSizeBytes = int(blockSize)
 
 	rng, _ := randutil.NewPseudoRand()
-	typs := []coltypes.T{coltypes.Int64}
-	batch := colexec.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0, 0)
-	op := colexec.NewRepeatableBatchSource(testAllocator, batch)
+	typs := []*types.T{types.Int}
+	batch := coldatatestutils.RandomBatch(testAllocator, rng, typs, coldata.BatchSize(), 0, 0)
+	op := colexecbase.NewRepeatableBatchSource(testAllocator, batch, typs)
 	ctx := context.Background()
 	for i := 0; i < b.N; i++ {
 		op.ResetBatchesToReturn(numBatches)
-		q, err := colcontainer.NewDiskQueue(typs, queueCfg)
+		q, err := colcontainer.NewDiskQueue(ctx, typs, queueCfg, testDiskAcc)
 		require.NoError(b, err)
 		for {
 			batchToEnqueue := op.Next(ctx)
-			if err := q.Enqueue(batchToEnqueue); err != nil {
+			if err := q.Enqueue(ctx, batchToEnqueue); err != nil {
 				b.Fatal(err)
 			}
 			if batchToEnqueue.Length() == 0 {
 				break
 			}
 		}
-		dequeuedBatch := coldata.NewMemBatch(typs)
+		dequeuedBatch := coldata.NewMemBatch(typs, testColumnFactory)
 		for dequeuedBatch.Length() != 0 {
-			if _, err := q.Dequeue(dequeuedBatch); err != nil {
+			if _, err := q.Dequeue(ctx, dequeuedBatch); err != nil {
 				b.Fatal(err)
 			}
 		}
-		if err := q.Close(); err != nil {
+		if err := q.Close(ctx); err != nil {
 			b.Fatal(err)
 		}
 	}

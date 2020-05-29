@@ -25,8 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/gossip"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagebase"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storagepb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
@@ -37,9 +37,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
+	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -108,7 +108,7 @@ func TestNodeLiveness(t *testing.T) {
 			if err == nil {
 				break
 			}
-			if err == kvserver.ErrEpochIncremented {
+			if errors.Is(err, kvserver.ErrEpochIncremented) {
 				log.Warningf(context.Background(), "retrying after %s", err)
 				continue
 			}
@@ -224,7 +224,7 @@ func TestNodeHeartbeatCallback(t *testing.T) {
 
 	// Verify that last update time has been set for all nodes.
 	verifyUptimes := func() error {
-		expected := mtc.clock.Now()
+		expected := mtc.clock().Now()
 		for i, s := range mtc.stores {
 			uptm, err := s.ReadLastUpTimestamp(context.Background())
 			if err != nil {
@@ -316,7 +316,7 @@ func TestNodeLivenessEpochIncrement(t *testing.T) {
 	}
 
 	// Verify error on incrementing an already-incremented epoch.
-	if err := mtc.nodeLivenesses[0].IncrementEpoch(context.Background(), oldLiveness); err != kvserver.ErrEpochAlreadyIncremented {
+	if err := mtc.nodeLivenesses[0].IncrementEpoch(context.Background(), oldLiveness); !errors.Is(err, kvserver.ErrEpochAlreadyIncremented) {
 		t.Fatalf("unexpected error incrementing a non-live node: %+v", err)
 	}
 
@@ -346,7 +346,7 @@ func TestNodeLivenessRestart(t *testing.T) {
 	for _, g := range mtc.gossips {
 		key := gossip.MakeNodeLivenessKey(g.NodeID.Get())
 		expKeys = append(expKeys, key)
-		if err := g.AddInfoProto(key, &storagepb.Liveness{}, 0); err != nil {
+		if err := g.AddInfoProto(key, &kvserverpb.Liveness{}, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -403,7 +403,7 @@ func TestNodeLivenessSelf(t *testing.T) {
 	// Verify liveness is properly initialized. This needs to be wrapped in a
 	// SucceedsSoon because node liveness gets initialized via an async gossip
 	// callback.
-	var liveness storagepb.Liveness
+	var liveness kvserverpb.Liveness
 	testutils.SucceedsSoon(t, func() error {
 		var err error
 		liveness, err = mtc.nodeLivenesses[0].GetLiveness(g.NodeID.Get())
@@ -475,7 +475,7 @@ func TestNodeLivenessGetIsLiveMap(t *testing.T) {
 
 	testutils.SucceedsSoon(t, func() error {
 		if err := mtc.nodeLivenesses[0].Heartbeat(context.Background(), liveness); err != nil {
-			if err == kvserver.ErrEpochIncremented {
+			if errors.Is(err, kvserver.ErrEpochIncremented) {
 				return err
 			}
 			t.Fatal(err)
@@ -506,7 +506,7 @@ func TestNodeLivenessGetLivenesses(t *testing.T) {
 
 	livenesses := mtc.nodeLivenesses[0].GetLivenesses()
 	actualLMapNodes := make(map[roachpb.NodeID]struct{})
-	originalExpiration := mtc.clock.PhysicalNow() + mtc.nodeLivenesses[0].GetLivenessThreshold().Nanoseconds()
+	originalExpiration := mtc.clock().PhysicalNow() + mtc.nodeLivenesses[0].GetLivenessThreshold().Nanoseconds()
 	for _, l := range livenesses {
 		if a, e := l.Epoch, int64(1); a != e {
 			t.Errorf("liveness record had epoch %d, wanted %d", a, e)
@@ -609,7 +609,7 @@ func TestNodeLivenessConcurrentIncrementEpochs(t *testing.T) {
 		}()
 	}
 	for i := 0; i < concurrency; i++ {
-		if err := <-errCh; err != nil && err != kvserver.ErrEpochAlreadyIncremented {
+		if err := <-errCh; err != nil && !errors.Is(err, kvserver.ErrEpochAlreadyIncremented) {
 			t.Fatalf("concurrent increment epoch %d failed: %+v", i, err)
 		}
 	}
@@ -642,11 +642,11 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 
 	// Verify success on failed update of a liveness record that already has the
 	// given draining setting.
-	if err := mtc.nodeLivenesses[drainingNodeIdx].SetDrainingInternal(ctx, storagepb.Liveness{}, false); err != nil {
+	if err := mtc.nodeLivenesses[drainingNodeIdx].SetDrainingInternal(ctx, kvserverpb.Liveness{}, false); err != nil {
 		t.Fatal(err)
 	}
 
-	mtc.nodeLivenesses[drainingNodeIdx].SetDraining(ctx, true)
+	mtc.nodeLivenesses[drainingNodeIdx].SetDraining(ctx, true /* drain */, nil /* reporter */)
 
 	// Draining node disappears from store lists.
 	{
@@ -656,7 +656,7 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			for i, sp := range mtc.storePools {
 				curNodeID := mtc.gossips[i].NodeID.Get()
-				sl, alive, _ := sp.GetStoreList(0)
+				sl, alive, _ := sp.GetStoreList()
 				if alive != expectedLive {
 					return errors.Errorf(
 						"expected %d live stores but got %d from node %d",
@@ -690,7 +690,7 @@ func TestNodeLivenessSetDraining(t *testing.T) {
 		testutils.SucceedsSoon(t, func() error {
 			for i, sp := range mtc.storePools {
 				curNodeID := mtc.gossips[i].NodeID.Get()
-				sl, alive, _ := sp.GetStoreList(0)
+				sl, alive, _ := sp.GetStoreList()
 				if alive != expectedLive {
 					return errors.Errorf(
 						"expected %d live stores but got %d from node %d",
@@ -721,7 +721,7 @@ func TestNodeLivenessRetryAmbiguousResultError(t *testing.T) {
 
 	injectError.Store(true)
 	storeCfg := kvserver.TestStoreConfig(nil)
-	storeCfg.TestingKnobs.EvalKnobs.TestingEvalFilter = func(args storagebase.FilterArgs) *roachpb.Error {
+	storeCfg.TestingKnobs.EvalKnobs.TestingEvalFilter = func(args kvserverbase.FilterArgs) *roachpb.Error {
 		if _, ok := args.Req.(*roachpb.ConditionalPutRequest); !ok {
 			return nil
 		}
@@ -803,7 +803,7 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 		// node will wait forever.
 		ReplicationMode: base.ReplicationManual,
 	})
-	ctx := context.TODO()
+	ctx := context.Background()
 	defer tc.Stopper().Stop(ctx)
 
 	ctx = logtags.AddTag(ctx, "in test", nil)
@@ -863,16 +863,16 @@ func TestNodeLivenessStatusMap(t *testing.T) {
 
 	type testCase struct {
 		nodeID         roachpb.NodeID
-		expectedStatus storagepb.NodeLivenessStatus
+		expectedStatus kvserverpb.NodeLivenessStatus
 	}
 
 	// Below we're going to check that all statuses converge and stabilize
 	// to a known situation.
 	testData := []testCase{
-		{liveNodeID, storagepb.NodeLivenessStatus_LIVE},
-		{deadNodeID, storagepb.NodeLivenessStatus_DEAD},
-		{decommissioningNodeID, storagepb.NodeLivenessStatus_DECOMMISSIONING},
-		{removedNodeID, storagepb.NodeLivenessStatus_DECOMMISSIONED},
+		{liveNodeID, kvserverpb.NodeLivenessStatus_LIVE},
+		{deadNodeID, kvserverpb.NodeLivenessStatus_DEAD},
+		{decommissioningNodeID, kvserverpb.NodeLivenessStatus_DECOMMISSIONING},
+		{removedNodeID, kvserverpb.NodeLivenessStatus_DECOMMISSIONED},
 	}
 
 	for _, test := range testData {
@@ -924,7 +924,7 @@ func testNodeLivenessSetDecommissioning(t *testing.T, decommissionNodeIdx int) {
 
 	// Verify success on failed update of a liveness record that already has the
 	// given decommissioning setting.
-	if _, err := callerNodeLiveness.SetDecommissioningInternal(ctx, nodeID, storagepb.Liveness{}, false); err != nil {
+	if _, err := callerNodeLiveness.SetDecommissioningInternal(ctx, nodeID, kvserverpb.Liveness{}, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -977,15 +977,15 @@ func TestNodeLivenessDecommissionAbsent(t *testing.T) {
 	// When the node simply never existed, expect an error.
 	if _, err := mtc.nodeLivenesses[0].SetDecommissioning(
 		ctx, goneNodeID, true,
-	); errors.Cause(err) != kvserver.ErrNoLivenessRecord {
+	); !errors.Is(err, kvserver.ErrNoLivenessRecord) {
 		t.Fatal(err)
 	}
 
 	// Pretend the node was once there but isn't gossiped anywhere.
-	if err := mtc.dbs[0].CPut(ctx, keys.NodeLivenessKey(goneNodeID), &storagepb.Liveness{
+	if err := mtc.dbs[0].CPut(ctx, keys.NodeLivenessKey(goneNodeID), &kvserverpb.Liveness{
 		NodeID:     goneNodeID,
 		Epoch:      1,
-		Expiration: hlc.LegacyTimestamp(mtc.clock.Now()),
+		Expiration: hlc.LegacyTimestamp(mtc.clock().Now()),
 	}, nil); err != nil {
 		t.Fatal(err)
 	}

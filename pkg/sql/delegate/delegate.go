@@ -16,6 +16,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 )
 
 // Certain statements (most SHOW variants) are just syntactic sugar for a more
@@ -79,7 +80,7 @@ func TryDelegate(
 		return d.delegateShowRoleGrants(t)
 
 	case *tree.ShowRoles:
-		return d.delegateShowRoles(t)
+		return d.delegateShowRoles()
 
 	case *tree.ShowSchemas:
 		return d.delegateShowSchemas(t)
@@ -97,7 +98,7 @@ func TryDelegate(
 		return d.delegateShowTables(t)
 
 	case *tree.ShowUsers:
-		return d.delegateShowUsers(t)
+		return d.delegateShowRoles()
 
 	case *tree.ShowVar:
 		return d.delegateShowVar(t)
@@ -107,6 +108,9 @@ func TryDelegate(
 
 	case *tree.ShowTransactionStatus:
 		return d.delegateShowVar(&tree.ShowVar{Name: "transaction_status"})
+
+	case *tree.ShowSavepointStatus:
+		return nil, unimplemented.NewWithIssue(47333, "cannot use SHOW SAVEPOINT STATUS as a statement source")
 
 	default:
 		return nil, nil

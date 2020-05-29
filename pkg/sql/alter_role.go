@@ -31,14 +31,12 @@ type alterRoleNode struct {
 	ifExists    bool
 	isRole      bool
 	roleOptions roleoption.List
-
-	run alterRoleRun
 }
 
-// AlterUser is an alias for AlterRole.
+// AlterRole represents a ALTER ROLE statement.
 // Privileges: CREATEROLE privilege.
-func (p *planner) AlterUser(ctx context.Context, n *tree.AlterUser) (planNode, error) {
-	return p.AlterRoleNode(ctx, n.Name, n.IfExists, n.IsRole, "ALTER USER", n.KVOptions)
+func (p *planner) AlterRole(ctx context.Context, n *tree.AlterRole) (planNode, error) {
+	return p.AlterRoleNode(ctx, n.Name, n.IfExists, n.IsRole, "ALTER ROLE", n.KVOptions)
 }
 
 func (p *planner) AlterRoleNode(
@@ -56,7 +54,10 @@ func (p *planner) AlterRoleNode(
 		return nil, err
 	}
 
-	roleOptions, err := kvOptions.ToRoleOptions(p.TypeAsStringOrNull, opName)
+	asStringOrNull := func(e tree.Expr, op string) (func() (bool, string, error), error) {
+		return p.TypeAsStringOrNull(ctx, e, op)
+	}
+	roleOptions, err := kvOptions.ToRoleOptions(asStringOrNull, opName)
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +65,7 @@ func (p *planner) AlterRoleNode(
 		return nil, err
 	}
 
-	ua, err := p.getUserAuthInfo(nameE, opName)
+	ua, err := p.getUserAuthInfo(ctx, nameE, opName)
 	if err != nil {
 		return nil, err
 	}
@@ -75,12 +76,6 @@ func (p *planner) AlterRoleNode(
 		isRole:       isRole,
 		roleOptions:  roleOptions,
 	}, nil
-}
-
-// alterRoleRun is the run-time state of
-// alterRoleNode for local execution.
-type alterRoleRun struct {
-	rowsAffected int
 }
 
 func (n *alterRoleNode) startExec(params runParams) error {
@@ -154,9 +149,18 @@ func (n *alterRoleNode) startExec(params runParams) error {
 				"setting or updating a password is not supported in insecure mode")
 		}
 
+		if hashedPassword == nil {
+			// v20.1 and below crash during authentication if they find a NULL value
+			// in system.users.hashedPassword. v20.2 and above handle this correctly,
+			// but we need to maintain mixed version compatibility for at least one
+			// release.
+			// TODO(nvanbenschoten): remove this for v21.1.
+			hashedPassword = []byte{}
+		}
+
 		// Updating PASSWORD is a special case since PASSWORD lives in system.users
 		// while the rest of the role options lives in system.role_options.
-		n.run.rowsAffected, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
+		_, err = params.extendedEvalCtx.ExecCfg.InternalExecutor.Exec(
 			params.ctx,
 			opName,
 			params.p.txn,
@@ -193,7 +197,7 @@ func (n *alterRoleNode) startExec(params runParams) error {
 			}
 		}
 
-		rowsAffected, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
+		_, err := params.extendedEvalCtx.ExecCfg.InternalExecutor.ExecEx(
 			params.ctx,
 			opName,
 			params.p.txn,
@@ -204,7 +208,6 @@ func (n *alterRoleNode) startExec(params runParams) error {
 		if err != nil {
 			return err
 		}
-		n.run.rowsAffected += rowsAffected
 	}
 
 	return nil
@@ -213,7 +216,3 @@ func (n *alterRoleNode) startExec(params runParams) error {
 func (*alterRoleNode) Next(runParams) (bool, error) { return false, nil }
 func (*alterRoleNode) Values() tree.Datums          { return tree.Datums{} }
 func (*alterRoleNode) Close(context.Context)        {}
-
-func (n *alterRoleNode) FastPathResults() (int, bool) {
-	return n.run.rowsAffected, true
-}

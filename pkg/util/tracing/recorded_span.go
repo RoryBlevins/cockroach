@@ -10,13 +10,36 @@
 
 package tracing
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// LogMessageField is the field name used for the opentracing.Span.LogFields()
+// for a log message.
+const LogMessageField = "event"
 
 func (s *RecordedSpan) String() string {
 	sb := strings.Builder{}
+	sb.WriteString(fmt.Sprintf("=== %s (id: %d parent: %d)\n", s.Operation, s.SpanID, s.ParentSpanID))
 	for _, ev := range s.Logs {
-		sb.WriteString(ev.String())
-		sb.WriteRune('\n')
+		sb.WriteString(fmt.Sprintf("%s %s\n", ev.Time.UTC().Format(time.RFC3339Nano), ev.Msg()))
 	}
 	return sb.String()
+}
+
+// Msg extracts the message of the LogRecord, which is either in an "event" or
+// "error" field.
+func (l LogRecord) Msg() string {
+	for _, f := range l.Fields {
+		key := f.Key
+		if key == LogMessageField {
+			return f.Value
+		}
+		if key == "error" {
+			return fmt.Sprint("error:", f.Value)
+		}
+	}
+	return ""
 }
